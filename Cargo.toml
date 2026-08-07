@@ -2,6 +2,10 @@
 name = "netwatch"
 version = "0.1.0"
 edition = "2024"
+# hickory-proto 0.26 is the actual floor; pinned here so `cargo build` fails
+# with one clear message instead of a confusing list of transitive icu_*/
+# hickory-proto version mismatches on an old toolchain.
+rust-version = "1.88"
 
 [profile.release]
 # Smaller, faster binary for a Pi's limited storage and memory bandwidth.

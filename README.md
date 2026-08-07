@@ -108,8 +108,12 @@ temperature, load, memory and uptime.
 ### Build on the Pi (simplest)
 
 Works on a Pi 3 or newer with ≥1 GB RAM. Takes 5–20 minutes depending on model.
+**Needs rustc 1.88 or newer** (via rustup — Debian/Raspbian's packaged `rustc`
+is usually far behind and will fail with a version-mismatch error listing
+`hickory-proto` and several `icu_*` crates).
 
 ```bash
+sudo apt remove -y rustc cargo 2>/dev/null  # drop any old apt-packaged Rust
 sudo apt update && sudo apt install -y build-essential curl git pkg-config
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
 source "$HOME/.cargo/env"
@@ -119,6 +123,9 @@ cd nostalgic_wheels
 cargo build --release
 sudo ./deploy/install.sh
 ```
+
+If you already have rustup but hit the version error, just `rustup update
+stable` and rebuild.
 
 The installer creates a `netwatch` system user, installs the binary and a
 hardened systemd unit, and prints what to do next. It is safe to re-run to
