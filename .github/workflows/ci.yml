@@ -1,0 +1,93 @@
+name: CI
+
+on:
+  # Only the default branch runs on push. Any other branch that has a PR open
+  # is covered by `pull_request`; listening to both would run every job twice
+  # per push, and the two events carry different refs so `concurrency` cannot
+  # collapse them.
+  push:
+    branches: [claude/raspberry-pi-optimization-31wp4b, main, master]
+  pull_request:
+  workflow_dispatch:
+
+# A new push supersedes an in-flight run for the same branch or PR.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  # Note: deliberately NOT setting `RUSTFLAGS: -D warnings` globally — that
+  # applies to dependencies too, so one warning in a third-party crate would
+  # break the build. `-D warnings` is passed to clippy for our crate instead.
+
+jobs:
+  test:
+    name: Test and lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Formatting
+        run: cargo fmt --all --check
+
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Tests
+        run: cargo test
+
+  cross:
+    name: Cross-compile for ${{ matrix.name }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Raspberry Pi 3/4/5 (64-bit)
+            target: aarch64-unknown-linux-gnu
+            # libc6-dev-*-cross is only a *Recommends* of the gcc-cross
+            # package, so with --no-install-recommends it has to be named
+            # explicitly. Without it the compiler falls back to the host
+            # /usr/include and ring fails on bits/libc-header-start.h.
+            packages: gcc-aarch64-linux-gnu libc6-dev-arm64-cross
+          - name: Raspberry Pi 32-bit / Zero 2 W
+            target: armv7-unknown-linux-gnueabihf
+            packages: gcc-arm-linux-gnueabihf libc6-dev-armhf-cross
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust for ${{ matrix.target }}
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      # SQLite and ring are compiled from C, so cross-compiling needs a real
+      # cross toolchain even for `cargo check`.
+      - name: Install cross toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends ${{ matrix.packages }}
+
+      # ARM is the deploy target, so a break here matters more than on x86.
+      - name: Check
+        run: cargo check --target ${{ matrix.target }} --all-targets
+        # Both linker variables are set unconditionally; cargo reads only the
+        # one matching --target. The name is the triple upper-cased with dashes
+        # replaced by underscores, so it cannot be built from an expression.
+        env:
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
+          CARGO_TARGET_ARMV7_UNKNOWN_LINUX_GNUEABIHF_LINKER: arm-linux-gnueabihf-gcc
+          CC_aarch64_unknown_linux_gnu: aarch64-linux-gnu-gcc
+          CC_armv7_unknown_linux_gnueabihf: arm-linux-gnueabihf-gcc

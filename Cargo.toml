@@ -1,0 +1,35 @@
+[package]
+name = "netwatch"
+version = "0.1.0"
+edition = "2024"
+# hickory-proto 0.26 is the actual floor; pinned here so `cargo build` fails
+# with one clear message instead of a confusing list of transitive icu_*/
+# hickory-proto version mismatches on an old toolchain.
+rust-version = "1.88"
+
+[profile.release]
+# Smaller, faster binary for a Pi's limited storage and memory bandwidth.
+lto = "thin"
+codegen-units = 1
+strip = true
+# Deliberately NOT panic = "abort": tokio isolates a panicking task, so one bad
+# request cannot take DNS down for the whole house. Aborting would.
+
+[dependencies]
+anyhow = "1.0.104"
+axum = "0.8.9"
+clap = { version = "4.6.6", features = ["derive"] }
+hickory-proto = "0.26.1"
+reqwest = { version = "0.13.4", default-features = false, features = ["__rustls", "charset", "gzip", "http2", "rustls-no-provider", "system-proxy"] }
+rusqlite = { version = "0.37", features = ["bundled"] }
+rustls = { version = "0.23.43", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+socket2 = "0.6.5"
+tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "net", "time", "sync", "signal", "fs", "io-util"] }
+toml = "1.1.4"
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter", "fmt", "ansi"] }
+
+[dev-dependencies]
+tokio = { version = "1.53.1", features = ["test-util"] }

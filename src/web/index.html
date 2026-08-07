@@ -1,0 +1,881 @@
+<!doctype html>
+<html lang="en" data-theme="dark">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>netwatch</title>
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<style>
+/* ---------------------------------------------------------------------------
+   Tokens. Light values live on bare :root; dark values are redefined under
+   both the OS media query and the explicit toggle so either can win.
+   --------------------------------------------------------------------------- */
+:root {
+  color-scheme: light;
+  --surface-1:      #fcfcfb;
+  --page:           #f9f9f7;
+  --text-primary:   #0b0b0b;
+  --text-secondary: #52514e;
+  --text-muted:     #898781;
+  --grid:           #e1e0d9;
+  --axis:           #c3c2b7;
+  --border:         rgba(11,11,11,0.10);
+  --series-allowed: #2a78d6;
+  --series-blocked: #e34948;
+  --series-rx:      #2a78d6;
+  --series-tx:      #eb6834;
+  --good:           #0ca30c;
+  --warning:        #fab219;
+  --critical:       #d03b3b;
+  --success-text:   #006300;
+  --hover:          rgba(11,11,11,0.04);
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    color-scheme: dark;
+    --surface-1:      #1a1a19;
+    --page:           #0d0d0d;
+    --text-primary:   #ffffff;
+    --text-secondary: #c3c2b7;
+    --text-muted:     #898781;
+    --grid:           #2c2c2a;
+    --axis:           #383835;
+    --border:         rgba(255,255,255,0.10);
+    --series-allowed: #3987e5;
+    --series-blocked: #e66767;
+    --series-rx:      #3987e5;
+    --series-tx:      #d95926;
+    --success-text:   #0ca30c;
+    --hover:          rgba(255,255,255,0.06);
+  }
+}
+:root[data-theme="dark"] {
+  color-scheme: dark;
+  --surface-1:      #1a1a19;
+  --page:           #0d0d0d;
+  --text-primary:   #ffffff;
+  --text-secondary: #c3c2b7;
+  --text-muted:     #898781;
+  --grid:           #2c2c2a;
+  --axis:           #383835;
+  --border:         rgba(255,255,255,0.10);
+  --series-allowed: #3987e5;
+  --series-blocked: #e66767;
+  --series-rx:      #3987e5;
+  --series-tx:      #d95926;
+  --success-text:   #0ca30c;
+  --hover:          rgba(255,255,255,0.06);
+}
+
+* { box-sizing: border-box; }
+body {
+  margin: 0;
+  background: var(--page);
+  color: var(--text-primary);
+  font: 14px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif;
+  -webkit-font-smoothing: antialiased;
+}
+h1, h2, h3 { margin: 0; font-weight: 600; }
+a { color: var(--series-allowed); }
+
+.wrap { max-width: 1400px; margin: 0 auto; padding: 20px 16px 64px; }
+
+header {
+  display: flex; align-items: center; gap: 12px; flex-wrap: wrap;
+  padding-bottom: 16px; margin-bottom: 20px;
+  border-bottom: 1px solid var(--border);
+}
+header h1 { font-size: 18px; letter-spacing: -0.01em; }
+header .sub { color: var(--text-muted); font-size: 12px; }
+header .spacer { flex: 1 1 auto; }
+
+.pill {
+  display: inline-flex; align-items: center; gap: 6px;
+  padding: 3px 9px; border-radius: 999px;
+  border: 1px solid var(--border);
+  font-size: 12px; color: var(--text-secondary);
+  background: var(--surface-1);
+}
+.dot { width: 7px; height: 7px; border-radius: 50%; background: var(--good); flex: none; }
+.dot.bad { background: var(--critical); }
+
+button, select, input {
+  font: inherit; color: var(--text-primary);
+  background: var(--surface-1);
+  border: 1px solid var(--border);
+  border-radius: 7px; padding: 6px 10px;
+}
+button { cursor: pointer; }
+button:hover { background: var(--hover); }
+button.ghost { background: transparent; }
+button.tiny { padding: 2px 7px; font-size: 12px; border-radius: 5px; }
+
+/* --- cards ---------------------------------------------------------------- */
+.card {
+  background: var(--surface-1);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 16px;
+}
+.card > header {
+  display: flex; align-items: baseline; gap: 10px;
+  padding: 0 0 12px; margin: 0; border: 0;
+}
+.card h2 { font-size: 13px; letter-spacing: 0.02em; text-transform: uppercase; color: var(--text-secondary); }
+.card .note { font-size: 12px; color: var(--text-muted); }
+
+.grid { display: grid; gap: 14px; }
+.tiles { grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); margin-bottom: 14px; }
+.two { grid-template-columns: repeat(auto-fit, minmax(340px, 1fr)); }
+
+/* --- stat tiles ----------------------------------------------------------- */
+.tile .label { font-size: 12px; color: var(--text-secondary); }
+.tile .value { font-size: 28px; font-weight: 600; letter-spacing: -0.02em; line-height: 1.15; margin-top: 4px; }
+.tile .meta { font-size: 12px; color: var(--text-muted); margin-top: 2px; }
+.tile .meta strong { color: var(--text-secondary); font-weight: 500; }
+
+/* --- charts --------------------------------------------------------------- */
+.chart-head { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; margin-bottom: 6px; }
+.legend { display: flex; gap: 14px; flex-wrap: wrap; font-size: 12px; color: var(--text-secondary); }
+.legend span { display: inline-flex; align-items: center; gap: 6px; }
+.swatch { display: inline-block; width: 10px; height: 10px; border-radius: 3px; flex: none; }
+figure { margin: 0; position: relative; }
+figcaption { font-size: 12px; color: var(--text-muted); margin-top: 8px; }
+svg { display: block; width: 100%; height: auto; overflow: visible; }
+.gridline { stroke: var(--grid); stroke-width: 1; }
+.baseline { stroke: var(--axis); stroke-width: 1; }
+.tick { fill: var(--text-muted); font-size: 10px; font-variant-numeric: tabular-nums; }
+.crosshair { stroke: var(--axis); stroke-width: 1; pointer-events: none; }
+
+.tooltip {
+  position: absolute; pointer-events: none; z-index: 5;
+  background: var(--surface-1); color: var(--text-primary);
+  border: 1px solid var(--border); border-radius: 8px;
+  padding: 8px 10px; font-size: 12px; min-width: 130px;
+  box-shadow: 0 6px 20px rgba(0,0,0,0.18);
+  opacity: 0; transition: opacity 0.1s;
+}
+.tooltip.on { opacity: 1; }
+.tooltip .tt-title { color: var(--text-secondary); margin-bottom: 5px; }
+.tooltip .tt-row { display: flex; align-items: center; gap: 6px; justify-content: space-between; }
+.tooltip .tt-row b { font-variant-numeric: tabular-nums; font-weight: 600; }
+
+/* --- tables -------------------------------------------------------------- */
+.scroll { overflow-x: auto; }
+/* The query log can hold hundreds of rows; give it its own scroll region with a
+   pinned header rather than letting it stretch the page. */
+.scroll.tall { max-height: 60vh; overflow-y: auto; }
+.scroll.tall thead th { position: sticky; top: 0; background: var(--surface-1); z-index: 1; }
+table { width: 100%; border-collapse: collapse; font-size: 13px; }
+th, td { text-align: left; padding: 7px 10px; border-bottom: 1px solid var(--border); white-space: nowrap; }
+th { color: var(--text-muted); font-weight: 500; font-size: 11px; text-transform: uppercase; letter-spacing: 0.03em; }
+tbody tr:hover { background: var(--hover); }
+td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
+td.domain { max-width: 340px; overflow: hidden; text-overflow: ellipsis; }
+.mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; }
+
+.tag { display: inline-flex; align-items: center; gap: 5px; font-size: 12px; }
+.tag::before { content: ""; width: 7px; height: 7px; border-radius: 50%; background: var(--text-muted); }
+.tag.blocked { color: var(--critical); }
+.tag.blocked::before { background: var(--critical); }
+.tag.forwarded::before { background: var(--series-allowed); }
+.tag.cached::before { background: var(--good); }
+.tag.nxdomain::before, .tag.servfail::before, .tag.refused::before { background: var(--warning); }
+
+.bar-row { display: grid; grid-template-columns: 1fr auto; gap: 10px; align-items: center; padding: 5px 0; }
+.bar-row .name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.bar-row .track { grid-column: 1 / -1; height: 4px; border-radius: 2px; background: var(--grid); overflow: hidden; }
+/* Both must be blocks: a percentage width on an inline span resolves to zero. */
+.bar-row .track, .bar-row .fill { display: block; }
+.bar-row .fill { height: 100%; border-radius: 2px; }
+.bar-row .n { font-variant-numeric: tabular-nums; color: var(--text-secondary); font-size: 12px; }
+
+.filters { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 12px; }
+.filters input[type=search] { min-width: 200px; flex: 1 1 200px; }
+.empty { color: var(--text-muted); padding: 20px 0; text-align: center; font-size: 13px; }
+.err { color: var(--critical); font-size: 12px; }
+.hidden { display: none !important; }
+.kv { display: grid; grid-template-columns: auto 1fr; gap: 4px 14px; font-size: 13px; }
+.kv dt { color: var(--text-muted); }
+.kv dd { margin: 0; color: var(--text-secondary); }
+.sr {
+  position: absolute; width: 1px; height: 1px; overflow: hidden;
+  clip: rect(0 0 0 0); white-space: nowrap;
+}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<header>
+  <div>
+    <h1>netwatch</h1>
+    <div class="sub" id="subtitle">DNS-level network monitor</div>
+  </div>
+  <div class="spacer"></div>
+  <span class="pill"><span class="dot" id="live-dot"></span><span id="live-text">connecting</span></span>
+  <select id="range" aria-label="Time range">
+    <option value="1">Last hour</option>
+    <option value="6">Last 6 hours</option>
+    <option value="24" selected>Last 24 hours</option>
+    <option value="168">Last 7 days</option>
+  </select>
+  <button class="ghost" id="theme">Theme</button>
+</header>
+
+<!-- Headline numbers: single values, so no chart. -->
+<section class="grid tiles" id="tiles" aria-label="Summary"></section>
+
+<section class="grid two" style="margin-bottom:14px">
+  <div class="card">
+    <div class="chart-head">
+      <h2>DNS queries over time</h2>
+      <div class="spacer" style="flex:1"></div>
+      <div class="legend">
+        <span><i class="swatch" style="background:var(--series-allowed)"></i>Allowed</span>
+        <span><i class="swatch" style="background:var(--series-blocked)"></i>Blocked</span>
+      </div>
+      <button class="ghost tiny" data-table-toggle="queries-chart">Table</button>
+    </div>
+    <figure>
+      <svg id="queries-chart" role="img" aria-label="Stacked bars of allowed and blocked DNS queries over time"></svg>
+      <div class="tooltip" id="queries-tip" role="status"></div>
+      <figcaption id="queries-caption"></figcaption>
+    </figure>
+    <div class="scroll hidden" id="queries-chart-table"></div>
+  </div>
+
+  <div class="card">
+    <div class="chart-head">
+      <h2>Interface throughput</h2>
+      <div class="spacer" style="flex:1"></div>
+      <div class="legend">
+        <span><i class="swatch" style="background:var(--series-rx)"></i>Download</span>
+        <span><i class="swatch" style="background:var(--series-tx)"></i>Upload</span>
+      </div>
+      <button class="ghost tiny" data-table-toggle="iface-chart">Table</button>
+    </div>
+    <figure>
+      <svg id="iface-chart" role="img" aria-label="Lines of download and upload throughput over time"></svg>
+      <div class="tooltip" id="iface-tip" role="status"></div>
+      <figcaption id="iface-caption"></figcaption>
+    </figure>
+    <div class="scroll hidden" id="iface-chart-table"></div>
+  </div>
+</section>
+
+<section class="grid two" style="margin-bottom:14px">
+  <div class="card">
+    <header><h2>Top allowed domains</h2></header>
+    <div id="top-domains"></div>
+  </div>
+  <div class="card">
+    <header><h2>Top blocked domains</h2></header>
+    <div id="top-blocked"></div>
+  </div>
+</section>
+
+<section class="card" style="margin-bottom:14px">
+  <header>
+    <h2>Devices on the LAN</h2>
+    <span class="note" id="devices-note"></span>
+  </header>
+  <div class="scroll tall" id="devices"></div>
+</section>
+
+<section class="card" style="margin-bottom:14px">
+  <header><h2>Query log</h2><span class="note" id="log-note"></span></header>
+  <div class="filters">
+    <input type="search" id="q-search" placeholder="Filter by domain…" aria-label="Filter by domain">
+    <select id="q-status" aria-label="Filter by status">
+      <option value="">All statuses</option>
+      <option value="forwarded">Forwarded</option>
+      <option value="cached">Cached</option>
+      <option value="blocked">Blocked</option>
+      <option value="nxdomain">NXDOMAIN</option>
+      <option value="servfail">SERVFAIL</option>
+    </select>
+    <select id="q-client" aria-label="Filter by client"><option value="">All clients</option></select>
+    <select id="q-limit" aria-label="Rows">
+      <option value="50">50 rows</option>
+      <option value="100" selected>100 rows</option>
+      <option value="300">300 rows</option>
+    </select>
+    <button class="ghost" id="q-pause">Pause</button>
+  </div>
+  <div class="scroll tall" id="log"></div>
+</section>
+
+<section class="grid two">
+  <div class="card">
+    <header><h2>Resolver status</h2></header>
+    <dl class="kv" id="status-kv"></dl>
+  </div>
+  <div class="card">
+    <header><h2>Add a rule</h2></header>
+    <div class="filters">
+      <input type="text" id="rule-domain" placeholder="example.com" aria-label="Domain">
+      <button id="rule-deny">Block</button>
+      <button id="rule-allow">Allow</button>
+    </div>
+    <div class="note" id="rule-msg">Allow rules override every blocklist. Changes apply immediately and flush the DNS cache.</div>
+    <header style="margin-top:14px"><h2>Query types</h2></header>
+    <div id="query-types"></div>
+  </div>
+</section>
+
+</div>
+
+<script>
+"use strict";
+
+/* ---------------------------------------------------------------------------
+   Helpers
+   --------------------------------------------------------------------------- */
+const $ = (id) => document.getElementById(id);
+const state = { hours: 24, paused: false, timer: null, clients: new Set() };
+
+function esc(s) {
+  return String(s == null ? "" : s).replace(/[&<>"']/g, (c) =>
+    ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+}
+function num(n) { return (n == null ? "—" : Number(n).toLocaleString()); }
+function pct(n) { return (n == null ? "—" : n.toFixed(1) + "%"); }
+
+function bits(bps) {
+  if (bps == null) return "—";
+  const u = ["bps", "kbps", "Mbps", "Gbps"];
+  let i = 0, v = bps;
+  while (v >= 1000 && i < u.length - 1) { v /= 1000; i++; }
+  return (v < 10 && i > 0 ? v.toFixed(1) : Math.round(v)) + " " + u[i];
+}
+function bytes(b) {
+  if (b == null) return "—";
+  const u = ["B", "KiB", "MiB", "GiB", "TiB"];
+  let i = 0, v = b;
+  while (v >= 1024 && i < u.length - 1) { v /= 1024; i++; }
+  return (v < 10 && i > 0 ? v.toFixed(1) : Math.round(v)) + " " + u[i];
+}
+function clock(ts) {
+  return new Date(ts * 1000).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+}
+function stamp(ts) {
+  const d = new Date(ts * 1000);
+  return d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" });
+}
+function ago(ts) {
+  const s = Math.max(0, Math.floor(Date.now() / 1000) - ts);
+  if (s < 60) return s + "s ago";
+  if (s < 3600) return Math.floor(s / 60) + "m ago";
+  if (s < 86400) return Math.floor(s / 3600) + "h ago";
+  return Math.floor(s / 86400) + "d ago";
+}
+function dur(s) {
+  if (s == null) return "—";
+  const d = Math.floor(s / 86400), h = Math.floor((s % 86400) / 3600), m = Math.floor((s % 3600) / 60);
+  if (d) return `${d}d ${h}h`;
+  if (h) return `${h}h ${m}m`;
+  return `${m}m`;
+}
+
+async function api(path, opts) {
+  const r = await fetch(path, opts);
+  if (!r.ok) throw new Error(`${path}: HTTP ${r.status}`);
+  return r.json();
+}
+
+function live(ok, text) {
+  $("live-dot").classList.toggle("bad", !ok);
+  $("live-text").textContent = text;
+}
+
+/* ---------------------------------------------------------------------------
+   Charts. Hand-rolled SVG: no external libraries, because this dashboard has
+   to work on a Pi with no internet access.
+   --------------------------------------------------------------------------- */
+const NS = "http://www.w3.org/2000/svg";
+function el(name, attrs, text) {
+  const n = document.createElementNS(NS, name);
+  for (const k in attrs) n.setAttribute(k, attrs[k]);
+  if (text != null) n.textContent = text;
+  return n;
+}
+
+/** Round scale maximum up to something a human would pick for a tick. */
+function niceMax(v) {
+  if (v <= 0) return 1;
+  const mag = Math.pow(10, Math.floor(Math.log10(v)));
+  const norm = v / mag;
+  const step = norm <= 1 ? 1 : norm <= 2 ? 2 : norm <= 5 ? 5 : 10;
+  return step * mag;
+}
+
+const PAD = { t: 10, r: 10, b: 22, l: 44 };
+const W = 640, H = 210;
+
+function frame(svg, maxY, fmtY, xTicks) {
+  svg.setAttribute("viewBox", `0 0 ${W} ${H}`);
+  svg.textContent = "";
+  const plotW = W - PAD.l - PAD.r, plotH = H - PAD.t - PAD.b;
+
+  // Recessive horizontal gridlines with value labels.
+  for (let i = 0; i <= 4; i++) {
+    const y = PAD.t + plotH - (plotH * i) / 4;
+    svg.appendChild(el("line", { class: "gridline", x1: PAD.l, x2: W - PAD.r, y1: y, y2: y }));
+    svg.appendChild(el("text", { class: "tick", x: PAD.l - 7, y: y + 3.5, "text-anchor": "end" },
+      fmtY((maxY * i) / 4)));
+  }
+  svg.appendChild(el("line", { class: "baseline", x1: PAD.l, x2: W - PAD.r, y1: PAD.t + plotH, y2: PAD.t + plotH }));
+
+  for (const t of xTicks) {
+    svg.appendChild(el("text",
+      { class: "tick", x: PAD.l + plotW * t.at, y: H - 6, "text-anchor": t.anchor || "middle" }, t.label));
+  }
+  return { plotW, plotH };
+}
+
+/** Attach a crosshair + tooltip driven by the nearest datum to the pointer. */
+function hover(svg, tip, count, xOf, render) {
+  if (!count) return;
+  const plotH = H - PAD.t - PAD.b;
+  const line = el("line", { class: "crosshair", y1: PAD.t, y2: PAD.t + plotH, x1: 0, x2: 0, opacity: 0 });
+  svg.appendChild(line);
+
+  const hit = el("rect", {
+    x: PAD.l, y: PAD.t, width: W - PAD.l - PAD.r, height: plotH,
+    fill: "transparent", style: "cursor:crosshair"
+  });
+  svg.appendChild(hit);
+
+  const move = (ev) => {
+    const box = svg.getBoundingClientRect();
+    // The SVG scales to its container, so map client px back to viewBox units.
+    const vx = ((ev.clientX - box.left) / box.width) * W;
+    let best = 0, bestD = Infinity;
+    for (let i = 0; i < count; i++) {
+      const d = Math.abs(xOf(i) - vx);
+      if (d < bestD) { bestD = d; best = i; }
+    }
+    line.setAttribute("x1", xOf(best));
+    line.setAttribute("x2", xOf(best));
+    line.setAttribute("opacity", 1);
+    tip.innerHTML = render(best);
+    tip.classList.add("on");
+    // Keep the tooltip inside the figure.
+    const px = (xOf(best) / W) * box.width;
+    const tw = tip.offsetWidth || 150;
+    tip.style.left = Math.max(0, Math.min(box.width - tw, px - tw / 2)) + "px";
+    tip.style.top = "4px";
+  };
+  hit.addEventListener("pointermove", move);
+  hit.addEventListener("pointerdown", move);
+  hit.addEventListener("pointerleave", () => {
+    line.setAttribute("opacity", 0);
+    tip.classList.remove("on");
+  });
+}
+
+/** Stacked bars: allowed + blocked per time bucket. */
+function drawQueries(buckets) {
+  const svg = $("queries-chart"), tip = $("queries-tip");
+  const cap = $("queries-caption");
+  if (!buckets.length) {
+    svg.textContent = "";
+    svg.setAttribute("viewBox", `0 0 ${W} ${H}`);
+    cap.textContent = "No queries recorded in this window yet.";
+    renderTable("queries-chart-table", ["Time", "Allowed", "Blocked"], []);
+    return;
+  }
+  const maxY = niceMax(Math.max(...buckets.map((b) => b.allowed + b.blocked)));
+  const ticks = [];
+  const n = buckets.length;
+  [0, Math.floor(n / 2), n - 1].forEach((i, k) => {
+    if (buckets[i]) ticks.push({
+      at: n === 1 ? 0.5 : i / (n - 1), label: clock(buckets[i].ts),
+      anchor: k === 0 ? "start" : k === 2 ? "end" : "middle"
+    });
+  });
+  const { plotW, plotH } = frame(svg, maxY, (v) => num(Math.round(v)), ticks);
+
+  const slot = plotW / n;
+  const bw = Math.max(1, Math.min(slot - 1.5, 22));
+  const xOf = (i) => PAD.l + slot * i + slot / 2;
+  const scale = (v) => (v / maxY) * plotH;
+
+  buckets.forEach((b, i) => {
+    const x = xOf(i) - bw / 2;
+    const hA = scale(b.allowed), hB = scale(b.blocked);
+    const r = Math.min(4, bw / 2);
+    // Blocked stacks on top of allowed, with a 2px surface gap between them.
+    if (b.allowed > 0) {
+      svg.appendChild(el("rect", {
+        x, width: bw, y: PAD.t + plotH - hA, height: Math.max(1, hA),
+        fill: "var(--series-allowed)", rx: b.blocked > 0 ? 0 : r
+      }));
+    }
+    if (b.blocked > 0) {
+      const gap = b.allowed > 0 ? 2 : 0;
+      svg.appendChild(el("rect", {
+        x, width: bw, y: PAD.t + plotH - hA - hB - gap, height: Math.max(1, hB),
+        fill: "var(--series-blocked)", rx: r
+      }));
+    }
+  });
+
+  hover(svg, tip, n, xOf, (i) => {
+    const b = buckets[i], tot = b.allowed + b.blocked;
+    return `<div class="tt-title">${esc(stamp(b.ts))}</div>
+      <div class="tt-row"><span><i class="swatch" style="background:var(--series-allowed)"></i> Allowed</span><b>${num(b.allowed)}</b></div>
+      <div class="tt-row"><span><i class="swatch" style="background:var(--series-blocked)"></i> Blocked</span><b>${num(b.blocked)}</b></div>
+      <div class="tt-row" style="margin-top:4px;color:var(--text-muted)"><span>Total</span><b>${num(tot)}</b></div>`;
+  });
+
+  const tot = buckets.reduce((a, b) => a + b.allowed + b.blocked, 0);
+  const blk = buckets.reduce((a, b) => a + b.blocked, 0);
+  cap.textContent = `${num(tot)} queries, ${num(blk)} blocked (${pct(tot ? (blk * 100) / tot : 0)}).`;
+
+  renderTable("queries-chart-table", ["Time", "Allowed", "Blocked"],
+    buckets.slice().reverse().map((b) => [stamp(b.ts), num(b.allowed), num(b.blocked)]), [false, true, true]);
+}
+
+/** Lines: download + upload for the busiest interface. */
+function drawIface(rows) {
+  const svg = $("iface-chart"), tip = $("iface-tip"), cap = $("iface-caption");
+  // Pick the interface carrying the most traffic; a Pi often has eth0 + wlan0.
+  const totals = {};
+  for (const r of rows) totals[r.iface] = (totals[r.iface] || 0) + r.rx_bps + r.tx_bps;
+  const iface = Object.keys(totals).sort((a, b) => totals[b] - totals[a])[0];
+  const series = rows.filter((r) => r.iface === iface);
+
+  if (series.length < 2) {
+    svg.textContent = "";
+    svg.setAttribute("viewBox", `0 0 ${W} ${H}`);
+    cap.textContent = "Collecting throughput samples…";
+    renderTable("iface-chart-table", ["Time", "Down", "Up"], []);
+    return;
+  }
+
+  const maxY = niceMax(Math.max(...series.map((r) => Math.max(r.rx_bps, r.tx_bps)), 1));
+  const n = series.length;
+  const ticks = [];
+  [0, Math.floor(n / 2), n - 1].forEach((i, k) => ticks.push({
+    at: i / (n - 1), label: clock(series[i].ts),
+    anchor: k === 0 ? "start" : k === 2 ? "end" : "middle"
+  }));
+  const { plotW, plotH } = frame(svg, maxY, (v) => bits(v), ticks);
+
+  const xOf = (i) => PAD.l + (plotW * i) / (n - 1);
+  const yOf = (v) => PAD.t + plotH - (v / maxY) * plotH;
+  const path = (key) => series.map((r, i) => `${i ? "L" : "M"}${xOf(i).toFixed(1)},${yOf(r[key]).toFixed(1)}`).join(" ");
+
+  for (const [key, color] of [["rx_bps", "var(--series-rx)"], ["tx_bps", "var(--series-tx)"]]) {
+    svg.appendChild(el("path", {
+      d: path(key), fill: "none", stroke: color, "stroke-width": 2,
+      "stroke-linecap": "round", "stroke-linejoin": "round"
+    }));
+  }
+
+  hover(svg, tip, n, xOf, (i) => {
+    const r = series[i];
+    return `<div class="tt-title">${esc(stamp(r.ts))} · ${esc(iface)}</div>
+      <div class="tt-row"><span><i class="swatch" style="background:var(--series-rx)"></i> Down</span><b>${bits(r.rx_bps)}</b></div>
+      <div class="tt-row"><span><i class="swatch" style="background:var(--series-tx)"></i> Up</span><b>${bits(r.tx_bps)}</b></div>`;
+  });
+
+  const last = series[series.length - 1];
+  cap.textContent = `${iface} — now ${bits(last.rx_bps)} down, ${bits(last.tx_bps)} up. `
+    + `Peak ${bits(Math.max(...series.map((r) => r.rx_bps)))} down.`;
+
+  renderTable("iface-chart-table", ["Time", "Down", "Up"],
+    series.slice().reverse().map((r) => [stamp(r.ts), bits(r.rx_bps), bits(r.tx_bps)]), [false, true, true]);
+}
+
+/** Every chart ships an equivalent table, reachable from its Table button. */
+function renderTable(id, cols, rows, numeric) {
+  const host = $(id);
+  if (!rows.length) { host.innerHTML = '<div class="empty">No data yet.</div>'; return; }
+  const th = cols.map((c, i) => `<th class="${numeric && numeric[i] ? "num" : ""}">${esc(c)}</th>`).join("");
+  const tb = rows.map((r) =>
+    "<tr>" + r.map((v, i) => `<td class="${numeric && numeric[i] ? "num" : ""}">${esc(v)}</td>`).join("") + "</tr>"
+  ).join("");
+  host.innerHTML = `<table><thead><tr>${th}</tr></thead><tbody>${tb}</tbody></table>`;
+}
+
+document.querySelectorAll("[data-table-toggle]").forEach((btn) => {
+  btn.addEventListener("click", () => {
+    const chart = $(btn.dataset.tableToggle);
+    const table = $(btn.dataset.tableToggle + "-table");
+    const showTable = table.classList.contains("hidden");
+    table.classList.toggle("hidden", !showTable);
+    chart.closest("figure").classList.toggle("hidden", showTable);
+    btn.textContent = showTable ? "Chart" : "Table";
+  });
+});
+
+/* ---------------------------------------------------------------------------
+   Ranked lists — a bar per row, magnitude relative to the top entry.
+   --------------------------------------------------------------------------- */
+function renderRanked(id, rows, color) {
+  const host = $(id);
+  if (!rows.length) { host.innerHTML = '<div class="empty">Nothing recorded yet.</div>'; return; }
+  const max = Math.max(...rows.map((r) => r.count), 1);
+  host.innerHTML = rows.map((r) => `
+    <div class="bar-row">
+      <span class="name" title="${esc(r.label)}">${esc(r.label)}${
+        r.sublabel ? ` <span style="color:var(--text-muted)">· ${esc(r.sublabel)}</span>` : ""}</span>
+      <span class="n">${num(r.count)}</span>
+      <span class="track"><span class="fill" style="width:${(r.count / max) * 100}%;background:${color}"></span></span>
+    </div>`).join("");
+}
+
+/* ---------------------------------------------------------------------------
+   Panels
+   --------------------------------------------------------------------------- */
+function renderTiles(s, st) {
+  const gwLat = (st.latency || []).find((l) => l.target === "gateway");
+  const upLat = (st.latency || []).find((l) => l.target === "upstream");
+  const hitRate = s.total_24h ? (s.cached_24h * 100) / s.total_24h : 0;
+  const mem = st.system && st.system.mem_total_kb
+    ? Math.round(((st.system.mem_total_kb - st.system.mem_available_kb) * 100) / st.system.mem_total_kb)
+    : null;
+
+  const tiles = [
+    { label: "Queries (24h)", value: num(s.total_24h), meta: `${s.queries_per_min.toFixed(1)}/min in the last hour` },
+    {
+      label: "Blocked (24h)", value: pct(s.block_percent),
+      meta: `${num(s.blocked_24h)} of ${num(s.total_24h)} · ${num(st.blocked_domains)} rules`,
+      color: "var(--series-blocked)"
+    },
+    { label: "Active devices", value: num(s.devices_active_24h), meta: `${num(s.device_count)} known on the LAN` },
+    { label: "Cache hit rate", value: pct(hitRate), meta: `${num(st.cache_entries)} entries cached` },
+    {
+      label: "Upstream latency",
+      value: s.avg_upstream_ms == null ? "—" : Math.round(s.avg_upstream_ms) + " ms",
+      meta: upLat ? `probe ${upLat.ms.toFixed(0)} ms` : "24h average"
+    },
+    {
+      label: "Gateway latency",
+      value: gwLat ? gwLat.ms.toFixed(1) + " ms" : "—",
+      meta: st.gateway ? esc(st.gateway) : "no default route"
+    },
+    {
+      label: "Pi health",
+      value: st.system && st.system.cpu_temp_c != null ? st.system.cpu_temp_c.toFixed(1) + "°C" : "—",
+      meta: `load ${st.system ? st.system.load1.toFixed(2) : "—"}${mem != null ? ` · mem ${mem}%` : ""}`
+    },
+    { label: "Uptime", value: dur(st.uptime_secs), meta: `netwatch ${esc(st.version)}` }
+  ];
+
+  $("tiles").innerHTML = tiles.map((t) => `
+    <div class="card tile">
+      <div class="label">${esc(t.label)}</div>
+      <div class="value"${t.color ? ` style="color:${t.color}"` : ""}>${t.value}</div>
+      <div class="meta">${t.meta}</div>
+    </div>`).join("");
+}
+
+function renderDevices(rows) {
+  const host = $("devices");
+  $("devices-note").textContent = `${rows.length} seen · MAC vendor from the OUI table`;
+  if (!rows.length) {
+    host.innerHTML = '<div class="empty">No devices discovered yet. The subnet sweep runs every couple of minutes.</div>';
+    return;
+  }
+  host.innerHTML = `<table>
+    <thead><tr>
+      <th>Device</th><th>IP</th><th>MAC</th><th>Vendor</th>
+      <th class="num">Queries 24h</th><th class="num">Blocked</th><th>Last seen</th>
+    </tr></thead><tbody>${rows.map((d) => `
+      <tr>
+        <td>${d.hostname ? esc(d.hostname) : '<span style="color:var(--text-muted)">unnamed</span>'}</td>
+        <td class="mono">${esc(d.ip || "—")}</td>
+        <td class="mono">${esc(d.mac)}${d.randomized
+          ? ' <span class="tag" style="color:var(--warning)" title="Locally administered address: this device randomises its MAC, so it is not a stable identity">random</span>'
+          : ""}</td>
+        <td>${esc(d.vendor || "—")}</td>
+        <td class="num">${num(d.queries_24h)}</td>
+        <td class="num">${d.blocked_24h ? `<span style="color:var(--series-blocked)">${num(d.blocked_24h)}</span>` : "0"}</td>
+        <td>${esc(ago(d.last_seen))}</td>
+      </tr>`).join("")}</tbody></table>`;
+}
+
+function renderLog(rows) {
+  const host = $("log");
+  $("log-note").textContent = `${rows.length} most recent`;
+  if (!rows.length) { host.innerHTML = '<div class="empty">No queries match.</div>'; return; }
+
+  for (const r of rows) {
+    if (r.client_ip && !state.clients.has(r.client_ip)) {
+      state.clients.add(r.client_ip);
+      const opt = document.createElement("option");
+      opt.value = r.client_ip;
+      opt.textContent = r.client_name ? `${r.client_ip} (${r.client_name})` : r.client_ip;
+      $("q-client").appendChild(opt);
+    }
+  }
+
+  host.innerHTML = `<table>
+    <thead><tr>
+      <th>Time</th><th>Client</th><th>Domain</th><th>Type</th>
+      <th>Status</th><th class="num">ms</th><th>Answer</th><th></th>
+    </tr></thead><tbody>${rows.map((r) => `
+      <tr>
+        <td class="mono">${esc(stamp(r.ts))}</td>
+        <td>${esc(r.client_name || r.client_ip)}</td>
+        <td class="domain" title="${esc(r.domain)}">${esc(r.domain)}</td>
+        <td class="mono">${esc(r.qtype)}</td>
+        <td><span class="tag ${esc(r.status)}">${esc(r.status)}${
+          r.blocklist ? ` <span style="color:var(--text-muted)" title="${esc(r.blocklist)}">·</span>` : ""}</span></td>
+        <td class="num">${r.elapsed_ms == null ? "—" : num(r.elapsed_ms)}</td>
+        <td class="domain mono" title="${esc(r.answer || "")}">${esc(r.answer || "—")}</td>
+        <td><button class="ghost tiny" data-act="${r.status === "blocked" ? "allow" : "deny"}"
+            data-domain="${esc(r.domain)}">${r.status === "blocked" ? "Allow" : "Block"}</button></td>
+      </tr>`).join("")}</tbody></table>`;
+}
+
+$("log").addEventListener("click", async (ev) => {
+  const btn = ev.target.closest("button[data-act]");
+  if (!btn) return;
+  btn.disabled = true;
+  try {
+    await rule(btn.dataset.act, btn.dataset.domain);
+    refresh();
+  } finally {
+    btn.disabled = false;
+  }
+});
+
+async function rule(kind, domain) {
+  const msg = $("rule-msg");
+  try {
+    const r = await api("/api/" + (kind === "allow" ? "allow" : "deny"), {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ domain })
+    });
+    msg.className = "note";
+    msg.textContent = `${kind === "allow" ? "Allowing" : "Blocking"} ${domain}. ${num(r.blocked_domains)} rules active.`;
+  } catch (e) {
+    msg.className = "err";
+    msg.textContent = String(e.message || e);
+  }
+}
+
+$("rule-deny").addEventListener("click", () => {
+  const d = $("rule-domain").value.trim();
+  if (d) rule("deny", d).then(refresh);
+});
+$("rule-allow").addEventListener("click", () => {
+  const d = $("rule-domain").value.trim();
+  if (d) rule("allow", d).then(refresh);
+});
+
+function renderStatus(st) {
+  const ifaces = (st.interfaces || []).map((i) =>
+    `${esc(i.iface)}: ${bytes(i.rx_bytes)} in / ${bytes(i.tx_bytes)} out`
+    + ` <span style="color:var(--text-muted)">· ${num(i.rx_packets + i.tx_packets)} pkts</span>`
+    + (i.rx_errors + i.tx_errors + i.rx_dropped + i.tx_dropped
+      ? ` <span style="color:var(--warning)">· ${num(i.rx_errors + i.tx_errors)} err, ${num(i.rx_dropped + i.tx_dropped)} drop</span>` : "")
+  ).join("<br>") || "—";
+
+  const items = [
+    ["DNS listening on", esc(st.dns_listen)],
+    ["Upstreams", (st.upstreams || []).map(esc).join(", ")],
+    ["Blocking", st.blocking_enabled ? `on · ${esc(st.blocking_mode)} · ${num(st.blocked_domains)} domains` : "off"],
+    ["Lists", (st.blocklist_sources || []).map((s) =>
+      `${esc(s.name.length > 46 ? "…" + s.name.slice(-46) : s.name)} (${num(s.entries)})`).join("<br>") || "—"],
+    ["LAN", esc(st.lan_subnet || "unknown")],
+    ["Gateway", esc(st.gateway || "none")],
+    ["Interfaces", ifaces],
+    ["Served", `${num(st.queries_total)} queries · ${num(st.cache_hits)} cache hits · ${num(st.queries_blocked)} blocked`],
+    ["Upstream errors", st.upstream_errors
+      ? `<span style="color:var(--warning)">${num(st.upstream_errors)}</span>` : "0"],
+    // Surfaced because a wrongly-excluded client is otherwise invisible: it
+    // just silently has no DNS.
+    ["Answering", (st.allow_from || []).map(esc).join(", ")
+      + (st.queries_denied
+        ? ` <span style="color:var(--warning)" title="Queries dropped because the source is outside dns.allow_from. If a device on your network has no DNS, add its subnet.">· ${num(st.queries_denied)} dropped from other sources</span>`
+        : "")]
+  ];
+  $("status-kv").innerHTML = items.map(([k, v]) => `<dt>${esc(k)}</dt><dd>${v}</dd>`).join("");
+}
+
+/* ---------------------------------------------------------------------------
+   Refresh loop
+   --------------------------------------------------------------------------- */
+async function refresh() {
+  const h = state.hours;
+  const logParams = new URLSearchParams({
+    limit: $("q-limit").value,
+    search: $("q-search").value.trim(),
+    status: $("q-status").value,
+    client: $("q-client").value
+  });
+
+  try {
+    const [summary, status, series, iface, topd, topb, clients, qtypes, devices, log] = await Promise.all([
+      api("/api/summary"),
+      api("/api/status"),
+      api(`/api/timeseries?hours=${h}`),
+      api(`/api/interfaces?minutes=${Math.min(1440, h * 60)}`),
+      api(`/api/top-domains?hours=${h}&limit=12`),
+      api(`/api/top-blocked?hours=${h}&limit=12`),
+      api(`/api/top-clients?hours=${h}&limit=12`),
+      api(`/api/query-types?hours=${h}`),
+      api("/api/devices"),
+      api(`/api/queries?${logParams}`)
+    ]);
+
+    renderTiles(summary, status);
+    renderStatus(status);
+    drawQueries(series);
+    drawIface(iface);
+    renderRanked("top-domains", topd, "var(--series-allowed)");
+    renderRanked("top-blocked", topb, "var(--series-blocked)");
+    renderRanked("query-types", qtypes, "var(--series-allowed)");
+    renderDevices(devices);
+    if (!state.paused) renderLog(log);
+    $("subtitle").textContent =
+      `${num(status.blocked_domains)} domains blocked · serving DNS on ${status.dns_listen}`;
+    live(true, "live");
+  } catch (e) {
+    live(false, "disconnected");
+    console.error(e);
+  }
+}
+
+/* --- controls -------------------------------------------------------------- */
+$("range").addEventListener("change", (e) => { state.hours = Number(e.target.value); refresh(); });
+$("q-search").addEventListener("input", debounce(refresh, 350));
+["q-status", "q-client", "q-limit"].forEach((id) => $(id).addEventListener("change", refresh));
+$("q-pause").addEventListener("click", (e) => {
+  state.paused = !state.paused;
+  e.target.textContent = state.paused ? "Resume" : "Pause";
+});
+
+$("theme").addEventListener("click", () => {
+  const now = document.documentElement.getAttribute("data-theme");
+  const next = now === "dark" ? "light" : "dark";
+  document.documentElement.setAttribute("data-theme", next);
+  try { localStorage.setItem("netwatch-theme", next); } catch (e) { /* private mode */ }
+});
+try {
+  const saved = localStorage.getItem("netwatch-theme");
+  if (saved) document.documentElement.setAttribute("data-theme", saved);
+} catch (e) { /* ignore */ }
+
+function debounce(fn, ms) {
+  let t;
+  return (...a) => { clearTimeout(t); t = setTimeout(() => fn(...a), ms); };
+}
+
+refresh();
+state.timer = setInterval(refresh, 5000);
+// Stop hammering the Pi while the tab is in the background.
+document.addEventListener("visibilitychange", () => {
+  clearInterval(state.timer);
+  if (!document.hidden) { refresh(); state.timer = setInterval(refresh, 5000); }
+});
+</script>
+</body>
+</html>
