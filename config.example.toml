@@ -1,0 +1,96 @@
+# netwatch configuration.
+#
+# Every key below is optional and shown with its default. Delete anything you
+# do not want to change. Install to /etc/netwatch/config.toml.
+
+[dns]
+# Serve DNS on all interfaces so LAN clients can reach it. Port 53 needs either
+# root or CAP_NET_BIND_SERVICE (the systemd unit grants the capability).
+listen = "0.0.0.0:53"
+
+# Answer over TCP as well. Required by spec: responses too big for UDP are
+# returned truncated, and the client then retries over TCP.
+enable_tcp = true
+
+# Upstream resolvers, tried in order. Some alternatives:
+#   Cloudflare  1.1.1.1        Quad9 (filters malware)  9.9.9.9
+#   Google      8.8.8.8        Your router (uses ISP DNS) 192.168.1.1
+upstreams = ["1.1.1.1:53", "9.9.9.9:53"]
+upstream_timeout_ms = 2500
+
+# Local answer cache. This is where most of the perceived speed-up comes from.
+cache = true
+cache_max_entries = 20000
+cache_min_ttl = 30
+cache_max_ttl = 86400
+
+[web]
+# Dashboard address. Keep this on the LAN — there is no authentication, so do
+# not port-forward it to the internet.
+listen = "0.0.0.0:8080"
+
+[storage]
+database = "/var/lib/netwatch/netwatch.db"
+
+# Query log rows older than this are deleted hourly. On an SD card, 14 days of
+# a normal household is roughly 50-150 MB.
+retention_days = 14
+
+# Writes are batched for this long before committing, which matters a lot for
+# SD card lifespan. Raise it to reduce wear further at the cost of the log
+# lagging slightly behind live traffic.
+flush_interval_ms = 750
+
+[discovery]
+# Read the kernel ARP table for IP <-> MAC pairs.
+arp = true
+arp_interval_secs = 15
+
+# Listen for mDNS/Bonjour announcements to learn device names. Skipped
+# automatically if Avahi already holds port 5353.
+mdns = true
+
+# Listen for DHCP requests, which carry both the MAC and the hostname the
+# device asks for. This only listens; it never answers, so your router stays
+# the only DHCP server on the network.
+dhcp = true
+
+# Send one harmless UDP probe to each address in the LAN so the kernel resolves
+# its MAC. Without this, devices that are idle never appear at all.
+sweep = true
+sweep_interval_secs = 120
+
+# Ask the router for PTR records of clients we cannot otherwise name.
+reverse_dns = true
+
+# Override the auto-detected LAN range. Normally unnecessary — netwatch reads it
+# from the routing table.
+# subnet = "192.168.1.0/24"
+
+# Optional full IEEE OUI database for exhaustive vendor coverage. ~140 common
+# consumer prefixes are built in, so this is a nice-to-have:
+#   curl -o /var/lib/netwatch/oui.csv https://standards-oui.ieee.org/oui/oui.csv
+# oui_file = "/var/lib/netwatch/oui.csv"
+
+[blocking]
+enabled = true
+
+# How a blocked name is answered:
+#   "zero_ip"  -> 0.0.0.0 / :: (clients fail fast; what Pi-hole does by default)
+#   "nxdomain" -> NXDOMAIN (tidier, but some apps retry harder)
+mode = "zero_ip"
+
+# Blocklists to download. StevenBlack's unified list is the usual starting
+# point (~130k domains: ads plus malware).
+sources = [
+  "https://raw.githubusercontent.com/StevenBlack/hosts/master/hosts",
+]
+
+# Extra lists you keep on disk. Hosts format or one domain per line; a leading
+# "*." makes it a wildcard covering subdomains.
+files = []
+
+refresh_hours = 24
+
+# Downloaded lists plus the dashboard-managed allow.list and deny.list.
+state_dir = "/var/lib/netwatch"
