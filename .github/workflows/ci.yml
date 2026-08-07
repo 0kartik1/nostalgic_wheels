@@ -1,14 +1,18 @@
 name: CI
 
 on:
+  # Only the default branch runs on push. Any other branch that has a PR open
+  # is covered by `pull_request`; listening to both would run every job twice
+  # per push, and the two events carry different refs so `concurrency` cannot
+  # collapse them.
   push:
-    branches: ['**']
+    branches: [claude/raspberry-pi-optimization-31wp4b, main, master]
   pull_request:
   workflow_dispatch:
 
-# A new push supersedes an in-flight run on the same branch.
+# A new push supersedes an in-flight run for the same branch or PR.
 concurrency:
-  group: ci-${{ github.ref }}
+  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
 env:
@@ -49,10 +53,14 @@ jobs:
         include:
           - name: Raspberry Pi 3/4/5 (64-bit)
             target: aarch64-unknown-linux-gnu
-            packages: gcc-aarch64-linux-gnu
+            # libc6-dev-*-cross is only a *Recommends* of the gcc-cross
+            # package, so with --no-install-recommends it has to be named
+            # explicitly. Without it the compiler falls back to the host
+            # /usr/include and ring fails on bits/libc-header-start.h.
+            packages: gcc-aarch64-linux-gnu libc6-dev-arm64-cross
           - name: Raspberry Pi 32-bit / Zero 2 W
             target: armv7-unknown-linux-gnueabihf
-            packages: gcc-arm-linux-gnueabihf
+            packages: gcc-arm-linux-gnueabihf libc6-dev-armhf-cross
     steps:
       - uses: actions/checkout@v4
 
