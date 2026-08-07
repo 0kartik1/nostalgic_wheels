@@ -7,6 +7,7 @@
 //! Pi-hole uses, and it is the only reliable way to attribute traffic to a
 //! device on a switched LAN.
 
+pub mod acl;
 pub mod cache;
 
 use crate::blocklist::Blocklist;
@@ -32,10 +33,16 @@ pub struct Stats {
     pub blocked: AtomicU64,
     pub cache_hits: AtomicU64,
     pub upstream_errors: AtomicU64,
+    /// Queries dropped because the source was not in `dns.allow_from`.
+    pub denied: AtomicU64,
 }
 
 pub struct Resolver {
     cfg: crate::config::DnsConfig,
+    acl: acl::Acl,
+    /// Latches so an unexpected off-LAN source is reported once, loudly,
+    /// instead of once per packet.
+    warned_denied: std::sync::atomic::AtomicBool,
     block_nxdomain: bool,
     blocklist: Arc<RwLock<Blocklist>>,
     cache: Arc<std::sync::Mutex<cache::Cache>>,
@@ -47,12 +54,27 @@ pub struct Resolver {
 impl Resolver {
     pub fn new(
         cfg: &crate::config::Config,
+        lan: Option<crate::netinfo::Subnet>,
         blocklist: Arc<RwLock<Blocklist>>,
         writer: Writer,
         devices: DeviceStore,
     ) -> Self {
+        // Validated during config load, so a parse failure here cannot happen;
+        // fall back to the safe default rather than panicking.
+        let mut acl = acl::Acl::parse(&cfg.dns.allow_from).unwrap_or_else(|e| {
+            tracing::error!("invalid dns.allow_from ({e:#}), falling back to private-only");
+            acl::Acl::parse(&[]).expect("empty ACL always parses")
+        });
+        if let Some(s) = lan
+            && acl.trust_subnet(s.network, s.prefix_len)
+        {
+            tracing::info!("also serving DNS to the detected LAN {s} (outside the private ranges)");
+        }
+
         Self {
             cfg: cfg.dns.clone(),
+            acl,
+            warned_denied: std::sync::atomic::AtomicBool::new(false),
             block_nxdomain: cfg.blocking.mode == "nxdomain",
             blocklist,
             cache: Arc::new(std::sync::Mutex::new(cache::Cache::new(
@@ -64,6 +86,32 @@ impl Resolver {
             devices,
             stats: Arc::new(Stats::default()),
         }
+    }
+
+    /// Whether this source may query us at all. Checked before the packet is
+    /// even parsed, so a flood of unauthorised traffic costs almost nothing.
+    ///
+    /// Denied queries are dropped rather than REFUSED: replying would still
+    /// send a packet to whatever address the attacker spoofed.
+    pub fn allows(&self, client: IpAddr) -> bool {
+        if self.acl.allows(client) {
+            return true;
+        }
+        self.stats.denied.fetch_add(1, Ordering::Relaxed);
+        if !self.warned_denied.swap(true, Ordering::Relaxed) {
+            tracing::warn!(
+                "dropping DNS query from {client}, which is outside dns.allow_from. \
+                 If this is a legitimate client, add its subnet to dns.allow_from. \
+                 Further drops are logged at debug level."
+            );
+        } else {
+            tracing::debug!("dropping DNS query from {client} (not in dns.allow_from)");
+        }
+        false
+    }
+
+    pub fn is_open_to_world(&self) -> bool {
+        self.acl.is_open_to_world()
     }
 
     pub fn cache_len(&self) -> usize {
@@ -428,6 +476,11 @@ pub async fn serve_udp(resolver: Arc<Resolver>, listen: SocketAddr) -> Result<()
             }
         };
 
+        // Cheapest possible rejection: no allocation, no parse, no reply.
+        if !resolver.allows(peer.ip()) {
+            continue;
+        }
+
         let request = buf[..len].to_vec();
         let resolver = Arc::clone(&resolver);
         let socket = Arc::clone(&socket);
@@ -465,6 +518,12 @@ pub async fn serve_tcp(resolver: Arc<Resolver>, listen: SocketAddr) -> Result<()
                 continue;
             }
         };
+
+        // Close on unauthorised sources before allocating a task for them.
+        if !resolver.allows(peer.ip()) {
+            continue;
+        }
+
         let resolver = Arc::clone(&resolver);
 
         tokio::spawn(async move {
@@ -538,6 +597,8 @@ mod tests {
         let cfg = crate::config::Config::default();
         let resolver = Resolver {
             cfg: cfg.dns.clone(),
+            acl: acl::Acl::parse(&cfg.dns.allow_from).unwrap(),
+            warned_denied: std::sync::atomic::AtomicBool::new(false),
             block_nxdomain: false,
             blocklist: Arc::new(RwLock::new(Blocklist::default())),
             cache: Arc::new(std::sync::Mutex::new(cache::Cache::new(10, 30, 300))),
@@ -568,6 +629,66 @@ mod tests {
         let resp = error_response(&msg, ResponseCode::Refused);
         assert_eq!(resp.metadata.response_code, ResponseCode::Refused);
         assert_eq!(resp.metadata.id, 7);
+    }
+
+    /// Build a resolver wired to an in-memory database, for tests that only
+    /// exercise decision logic rather than real network I/O.
+    fn test_resolver(cfg: &crate::config::Config) -> Resolver {
+        Resolver {
+            cfg: cfg.dns.clone(),
+            acl: acl::Acl::parse(&cfg.dns.allow_from).unwrap(),
+            warned_denied: std::sync::atomic::AtomicBool::new(false),
+            block_nxdomain: false,
+            blocklist: Arc::new(RwLock::new(Blocklist::default())),
+            cache: Arc::new(std::sync::Mutex::new(cache::Cache::new(10, 30, 300))),
+            writer: crate::db::spawn_writer(
+                crate::db::open(std::path::Path::new(":memory:")).unwrap(),
+                std::time::Duration::from_millis(10),
+                1,
+            ),
+            devices: DeviceStore::new_for_test(),
+            stats: Arc::new(Stats::default()),
+        }
+    }
+
+    #[test]
+    fn default_config_refuses_to_serve_the_internet() {
+        // This is the open-resolver guard: by default only the LAN is served.
+        let resolver = test_resolver(&crate::config::Config::default());
+
+        assert!(resolver.allows("192.168.1.20".parse().unwrap()));
+        assert!(resolver.allows("127.0.0.1".parse().unwrap()));
+        assert!(!resolver.allows("8.8.8.8".parse().unwrap()));
+        assert!(!resolver.allows("203.0.113.7".parse().unwrap()));
+
+        // Denials are counted so the dashboard can surface them.
+        assert_eq!(resolver.stats.denied.load(Ordering::Relaxed), 2);
+        assert!(!resolver.is_open_to_world());
+    }
+
+    #[test]
+    fn allow_from_any_is_respected_when_set_deliberately() {
+        let mut cfg = crate::config::Config::default();
+        cfg.dns.allow_from = vec!["any".to_string()];
+        let resolver = test_resolver(&cfg);
+
+        assert!(resolver.allows("8.8.8.8".parse().unwrap()));
+        assert_eq!(resolver.stats.denied.load(Ordering::Relaxed), 0);
+        assert!(
+            resolver.is_open_to_world(),
+            "startup must be able to warn about this"
+        );
+    }
+
+    #[test]
+    fn a_malformed_allow_from_is_rejected_at_config_load() {
+        let toml = "[dns]\nallow_from = [\"not-a-subnet\"]\n";
+        let cfg: crate::config::Config = toml::from_str(toml).unwrap();
+        // Deserialising is permissive; validation is what must catch it.
+        assert!(
+            crate::dns::acl::Acl::parse(&cfg.dns.allow_from).is_err(),
+            "a typo in allow_from must not silently change who is served"
+        );
     }
 
     #[test]

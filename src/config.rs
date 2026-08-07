@@ -23,6 +23,11 @@ pub struct DnsConfig {
     pub listen: SocketAddr,
     /// Also answer DNS over TCP (required for large responses).
     pub enable_tcp: bool,
+    /// Which clients may query us. Keywords `loopback`, `private`, `any`, or
+    /// CIDRs like "192.168.1.0/24". Defaults to loopback + private ranges:
+    /// answering the whole internet would make this an open resolver, which is
+    /// what DNS amplification attacks are built out of.
+    pub allow_from: Vec<String>,
     /// Upstream resolvers, tried in order on failure.
     pub upstreams: Vec<SocketAddr>,
     /// How long to wait for an upstream before trying the next one.
@@ -96,6 +101,7 @@ impl Default for DnsConfig {
         Self {
             listen: "0.0.0.0:53".parse().unwrap(),
             enable_tcp: true,
+            allow_from: vec!["loopback".to_string(), "private".to_string()],
             upstreams: vec!["1.1.1.1:53".parse().unwrap(), "9.9.9.9:53".parse().unwrap()],
             upstream_timeout_ms: 2500,
             cache: true,
@@ -181,6 +187,9 @@ impl Config {
             !self.dns.upstreams.is_empty(),
             "dns.upstreams must not be empty"
         );
+        // Fail at startup on a malformed ACL rather than silently falling back
+        // to a stance the operator did not choose.
+        crate::dns::acl::Acl::parse(&self.dns.allow_from)?;
         anyhow::ensure!(
             matches!(self.blocking.mode.as_str(), "zero_ip" | "nxdomain"),
             "blocking.mode must be \"zero_ip\" or \"nxdomain\", got {:?}",

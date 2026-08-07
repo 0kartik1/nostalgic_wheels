@@ -789,7 +789,13 @@ function renderStatus(st) {
     ["Interfaces", ifaces],
     ["Served", `${num(st.queries_total)} queries · ${num(st.cache_hits)} cache hits · ${num(st.queries_blocked)} blocked`],
     ["Upstream errors", st.upstream_errors
-      ? `<span style="color:var(--warning)">${num(st.upstream_errors)}</span>` : "0"]
+      ? `<span style="color:var(--warning)">${num(st.upstream_errors)}</span>` : "0"],
+    // Surfaced because a wrongly-excluded client is otherwise invisible: it
+    // just silently has no DNS.
+    ["Answering", (st.allow_from || []).map(esc).join(", ")
+      + (st.queries_denied
+        ? ` <span style="color:var(--warning)" title="Queries dropped because the source is outside dns.allow_from. If a device on your network has no DNS, add its subnet.">· ${num(st.queries_denied)} dropped from other sources</span>`
+        : "")]
   ];
   $("status-kv").innerHTML = items.map(([k, v]) => `<dt>${esc(k)}</dt><dd>${v}</dd>`).join("");
 }

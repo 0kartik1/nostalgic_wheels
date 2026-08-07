@@ -152,10 +152,22 @@ async fn main() -> Result<()> {
     // ---- resolver ----------------------------------------------------------
     let resolver = Arc::new(dns::Resolver::new(
         &cfg,
+        subnet,
         Arc::clone(&blocklist),
         writer.clone(),
         device_store.clone(),
     ));
+
+    // Serving the whole internet is a choice, not a default; say so if made.
+    if resolver.is_open_to_world() {
+        tracing::warn!(
+            "dns.allow_from permits ANY source address. If port 53 is reachable from \
+             the internet this is an open resolver and will be abused for DNS \
+             amplification attacks. Restrict it to \"private\" unless you are certain."
+        );
+    } else {
+        tracing::info!("answering DNS for {:?}", cfg.dns.allow_from);
+    }
 
     // ---- background workers ------------------------------------------------
     let mut tasks: Vec<tokio::task::JoinHandle<()>> = Vec::new();

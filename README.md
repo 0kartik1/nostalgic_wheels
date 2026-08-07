@@ -1,10 +1,13 @@
 # netwatch
 
+[![CI](https://github.com/0kartik1/nostalgic_wheels/actions/workflows/ci.yml/badge.svg)](https://github.com/0kartik1/nostalgic_wheels/actions/workflows/ci.yml)
+
 A network monitor and ad blocker for a Raspberry Pi on a home LAN, written in
 Rust. It answers DNS for your network, logs every lookup with the device that
 made it, blocks ad and tracker domains, and serves a live dashboard.
 
-Single binary, no runtime dependencies, ~10 MB of RAM in normal use.
+Single binary, no runtime dependencies. Measured resident memory: **17 MB** with
+a 100,000-domain blocklist loaded, **10 MB** with blocking off.
 
 ```
 ┌── Modem ── Router ─┬─ phone, laptop, TV, ...
@@ -176,6 +179,30 @@ nslookup github.com <pi-ip>          # should resolve
 nslookup graph.facebook.com <pi-ip>  # should return 0.0.0.0 once lists load
 ```
 
+### Who is allowed to ask
+
+netwatch answers **only the LAN** by default (`dns.allow_from = ["loopback",
+"private"]`), plus whatever subnet it detects on its own interface — so a
+household whose ISP hands out public addresses instead of RFC1918 still works.
+
+This default matters. A recursive resolver that answers anyone is an *open
+resolver*, and open resolvers get conscripted into DNS amplification attacks: a
+spoofed 60-byte query provokes a multi-kilobyte answer aimed at a victim. One
+forwarded port would be enough. Queries from outside the allowed set are
+dropped rather than refused, because replying would still send a packet to the
+spoofed address.
+
+To serve an extra subnet (a guest VLAN, a VPN range):
+
+```toml
+[dns]
+allow_from = ["loopback", "private", "10.8.0.0/24"]
+```
+
+`any` disables the protection entirely and logs a warning at startup. The
+dashboard's resolver panel shows the current rules and a count of dropped
+queries, so a wrongly-excluded client is easy to spot.
+
 ### Worth knowing before you switch the whole house over
 
 If netwatch stops, DNS stops and the network appears "down" to everyone, even
@@ -323,7 +350,7 @@ values.
 ## Development
 
 ```bash
-cargo test          # 33 unit tests: protocol, parsers, matching, storage
+cargo test          # 52 unit tests: protocol, ACL, parsers, matching, storage
 cargo clippy --all-targets
 cargo fmt
 
@@ -332,10 +359,16 @@ cargo run -- --dns-listen 127.0.0.1:5353 --web-listen 127.0.0.1:8080 \
              --database /tmp/netwatch.db --no-fetch
 ```
 
-Tests cover the DNS truncation and EDNS paths, blocklist parsing and wildcard
-matching, DHCP option parsing against malformed packets, `/proc` parsers with
-recorded fixtures, MAC normalisation and randomisation detection, and the
-device name/MAC correlation logic.
+Tests cover the DNS truncation and EDNS paths, the client ACL (including that
+it refuses the internet by default and will not silently widen an explicitly
+narrow rule), blocklist parsing, wildcard matching and source attribution, DHCP
+option parsing against malformed packets, `/proc` parsers with recorded
+fixtures, MAC normalisation and randomisation detection, device name/MAC
+correlation, and the storage invariants.
+
+CI runs the same three checks on every push, plus a cross-compile check for
+both Raspberry Pi targets — ARM is the deploy platform, so a break there
+matters more than one on x86.
 
 ## License
 

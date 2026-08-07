@@ -8,15 +8,23 @@ use anyhow::{Context, Result};
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
+/// Index into [`Blocklist::sources`].
+///
+/// Storing the source as an index rather than an owned `String` per entry is
+/// the difference between ~9 MB and ~200 KB of labels on a 100k-domain list:
+/// every entry used to carry its own copy of the same list URL.
+type SourceId = u16;
+
 #[derive(Debug, Default)]
 pub struct Blocklist {
-    /// Exact domain matches -> name of the list it came from.
-    exact: HashMap<String, String>,
+    /// Exact domain matches -> which list it came from.
+    exact: HashMap<String, SourceId>,
     /// `*.example.com` style rules, stored as the bare parent domain.
-    wildcards: HashMap<String, String>,
+    wildcards: HashMap<String, SourceId>,
     /// Always allowed, overrides everything above.
     allow: HashSet<String>,
     allow_wildcards: HashSet<String>,
+    /// The interning table: `SourceId` indexes into this.
     pub sources: Vec<SourceStat>,
 }
 
@@ -31,6 +39,30 @@ impl Blocklist {
         self.exact.len() + self.wildcards.len()
     }
 
+    fn source_name(&self, id: SourceId) -> &str {
+        self.sources
+            .get(id as usize)
+            .map_or("unknown", |s| s.name.as_str())
+    }
+
+    /// Intern a list name, returning its id.
+    fn intern(&mut self, name: &str) -> SourceId {
+        if let Some(i) = self.sources.iter().position(|s| s.name == name) {
+            return i as SourceId;
+        }
+        // Practically unreachable — nobody configures 65k lists — but wrapping
+        // silently would mislabel every entry, so clamp and say so.
+        if self.sources.len() >= SourceId::MAX as usize {
+            tracing::warn!("too many blocklist sources to label individually");
+            return SourceId::MAX - 1;
+        }
+        self.sources.push(SourceStat {
+            name: name.to_string(),
+            entries: 0,
+        });
+        (self.sources.len() - 1) as SourceId
+    }
+
     /// Returns the name of the list that blocked `domain`, or `None`.
     ///
     /// `domain` must already be lowercased with no trailing dot.
@@ -38,8 +70,8 @@ impl Blocklist {
         if self.is_allowed(domain) {
             return None;
         }
-        if let Some(src) = self.exact.get(domain) {
-            return Some(src.as_str());
+        if let Some(&src) = self.exact.get(domain) {
+            return Some(self.source_name(src));
         }
         // Walk up the labels: a.b.example.com checks b.example.com, example.com...
         let mut rest = domain;
@@ -48,8 +80,8 @@ impl Blocklist {
             if rest.is_empty() {
                 break;
             }
-            if let Some(src) = self.wildcards.get(rest) {
-                return Some(src.as_str());
+            if let Some(&src) = self.wildcards.get(rest) {
+                return Some(self.source_name(src));
             }
         }
         None
@@ -72,15 +104,13 @@ impl Blocklist {
         false
     }
 
-    fn add_block(&mut self, entry: &str, source: &str) {
+    fn add_block(&mut self, entry: &str, source: SourceId) {
         match normalize(entry) {
             Some(Entry::Exact(d)) => {
-                self.exact.entry(d).or_insert_with(|| source.to_string());
+                self.exact.entry(d).or_insert(source);
             }
             Some(Entry::Wildcard(d)) => {
-                self.wildcards
-                    .entry(d)
-                    .or_insert_with(|| source.to_string());
+                self.wildcards.entry(d).or_insert(source);
             }
             None => {}
         }
@@ -99,12 +129,18 @@ impl Blocklist {
     }
 
     /// Parse a list file's contents, returning how many entries were added.
+    ///
+    /// Also registers `source_name` and accumulates its entry count, so callers
+    /// never touch `sources` directly — doing so would desynchronise the
+    /// interning table from the ids already stored against each domain.
     pub fn ingest(&mut self, contents: &str, source_name: &str, allow: bool) -> usize {
         let before = if allow {
             self.allow.len() + self.allow_wildcards.len()
         } else {
             self.len()
         };
+        // Allow lists carry no attribution, so they get no source slot.
+        let source_id = if allow { 0 } else { self.intern(source_name) };
 
         for raw in contents.lines() {
             // Strip comments (# and !, the latter used by Adblock-style lists).
@@ -131,7 +167,7 @@ impl Blocklist {
                     if allow {
                         self.add_allow(domain);
                     } else {
-                        self.add_block(domain, source_name);
+                        self.add_block(domain, source_id);
                     }
                 }
             } else if fields.next().is_none() {
@@ -139,7 +175,7 @@ impl Blocklist {
                 if allow {
                     self.add_allow(first);
                 } else {
-                    self.add_block(first, source_name);
+                    self.add_block(first, source_id);
                 }
             }
         }
@@ -149,7 +185,11 @@ impl Blocklist {
         } else {
             self.len()
         };
-        after.saturating_sub(before)
+        let added = after.saturating_sub(before);
+        if !allow && let Some(stat) = self.sources.get_mut(source_id as usize) {
+            stat.entries += added;
+        }
+        added
     }
 
     pub fn ingest_file(&mut self, path: &Path, allow: bool) -> Result<usize> {
@@ -159,11 +199,7 @@ impl Blocklist {
             .file_name()
             .map(|s| s.to_string_lossy().to_string())
             .unwrap_or_else(|| path.display().to_string());
-        let n = self.ingest(&contents, &name, allow);
-        if !allow {
-            self.sources.push(SourceStat { name, entries: n });
-        }
-        Ok(n)
+        Ok(self.ingest(&contents, &name, allow))
     }
 }
 
@@ -260,11 +296,9 @@ pub fn build(cfg: &crate::config::Config) -> Blocklist {
         }
         match std::fs::read_to_string(&path) {
             Ok(contents) => {
-                let n = bl.ingest(&contents, url, false);
-                bl.sources.push(SourceStat {
-                    name: url.clone(),
-                    entries: n,
-                });
+                // `ingest` registers the source itself; pushing here too would
+                // list it twice in the dashboard.
+                bl.ingest(&contents, url, false);
             }
             Err(e) => tracing::error!("reading cached list {}: {e}", path.display()),
         }
@@ -380,6 +414,52 @@ mod tests {
         assert!(normalize("has space.com").is_none());
         assert!(normalize("bad..com").is_none());
         assert!(normalize("ok.example.com").is_some());
+    }
+
+    #[test]
+    fn attributes_each_domain_to_the_right_list() {
+        let mut bl = Blocklist::default();
+        bl.ingest("ads.one.com\n", "list-a", false);
+        bl.ingest("ads.two.com\n", "list-b", false);
+        bl.ingest("*.three.com\n", "list-c", false);
+
+        assert_eq!(bl.lookup("ads.one.com"), Some("list-a"));
+        assert_eq!(bl.lookup("ads.two.com"), Some("list-b"));
+        assert_eq!(bl.lookup("x.three.com"), Some("list-c"));
+        assert_eq!(bl.sources.len(), 3, "one slot per distinct list");
+    }
+
+    #[test]
+    fn a_list_ingested_twice_gets_one_source_slot() {
+        let mut bl = Blocklist::default();
+        bl.ingest("a.example.com\n", "same-list", false);
+        bl.ingest("b.example.com\n", "same-list", false);
+
+        assert_eq!(
+            bl.sources.len(),
+            1,
+            "the source must be interned, not duplicated"
+        );
+        assert_eq!(bl.sources[0].entries, 2, "counts accumulate across calls");
+        assert_eq!(bl.lookup("a.example.com"), Some("same-list"));
+        assert_eq!(bl.lookup("b.example.com"), Some("same-list"));
+    }
+
+    #[test]
+    fn allow_lists_do_not_create_source_slots() {
+        let mut bl = Blocklist::default();
+        bl.ingest("ads.example.com\n", "blocklist", false);
+        bl.ingest("ads.example.com\n", "allow.list", true);
+        assert_eq!(bl.sources.len(), 1, "only the blocklist is a source");
+        assert_eq!(bl.sources[0].name, "blocklist");
+    }
+
+    #[test]
+    fn first_list_to_claim_a_domain_keeps_the_attribution() {
+        let mut bl = Blocklist::default();
+        bl.ingest("dupe.example.com\n", "first", false);
+        bl.ingest("dupe.example.com\n", "second", false);
+        assert_eq!(bl.lookup("dupe.example.com"), Some("first"));
     }
 
     #[test]

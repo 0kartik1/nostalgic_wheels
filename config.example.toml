@@ -12,6 +12,17 @@ listen = "0.0.0.0:53"
 # returned truncated, and the client then retries over TCP.
 enable_tcp = true
 
+# Which clients may query us. Keywords "loopback", "private", "any", or CIDRs.
+# The subnet netwatch detects on its own interface is trusted automatically
+# under the "private" stance, so an ISP that hands out public addresses to LAN
+# devices still works.
+#
+# Do NOT use "any" unless port 53 is genuinely unreachable from the internet:
+# an open resolver gets abused for DNS amplification attacks. Add specific
+# ranges instead, e.g. a guest VLAN or a VPN subnet:
+#   allow_from = ["loopback", "private", "10.8.0.0/24"]
+allow_from = ["loopback", "private"]
+
 # Upstream resolvers, tried in order. Some alternatives:
 #   Cloudflare  1.1.1.1        Quad9 (filters malware)  9.9.9.9
 #   Google      8.8.8.8        Your router (uses ISP DNS) 192.168.1.1
