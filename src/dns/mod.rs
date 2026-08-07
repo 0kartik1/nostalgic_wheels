@@ -20,7 +20,7 @@ use hickory_proto::rr::{RData, Record, RecordType};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tokio::net::{TcpListener, UdpSocket};
 
 /// TTL handed out with a sinkholed answer. Short so unblocking takes effect
@@ -457,12 +457,55 @@ fn fit_udp(request: &[u8], response: Vec<u8>) -> Option<Vec<u8>> {
     }
 }
 
+/// How long to keep retrying a bind that fails with `AddrInUse` before giving
+/// up for good. Long enough to ride out a boot-time race — some other process
+/// (a DHCP client hook, a distro's local resolver stub) can transiently hold
+/// port 53 for the first few seconds after boot and then release it — short
+/// enough that a genuinely permanent conflict still surfaces quickly.
+const BIND_RETRY_WINDOW: Duration = Duration::from_secs(30);
+
+/// Retry a bind for up to `max_wait`, backing off between attempts.
+///
+/// Only `AddrInUse` is retried. Anything else — most importantly
+/// `PermissionDenied`, which is what an unprivileged process trying to bind
+/// port 53 actually gets — fails immediately, because waiting cannot fix it.
+async fn bind_with_retry<F, Fut, T>(what: &str, max_wait: Duration, mut attempt: F) -> Result<T>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = std::io::Result<T>>,
+{
+    let deadline = Instant::now() + max_wait;
+    let mut delay = Duration::from_millis(250);
+
+    loop {
+        match attempt().await {
+            Ok(v) => return Ok(v),
+            Err(e) if e.kind() == std::io::ErrorKind::AddrInUse && Instant::now() < deadline => {
+                tracing::warn!(
+                    "{what}: address in use, retrying in {delay:?} — another process may be \
+                     holding it briefly (common right after boot); giving up after {max_wait:?} total"
+                );
+                tokio::time::sleep(delay).await;
+                delay = (delay * 2).min(Duration::from_secs(5));
+            }
+            Err(e) => {
+                return Err(anyhow::Error::new(e).context(format!(
+                    "{what} (port 53 needs root or CAP_NET_BIND_SERVICE)"
+                )));
+            }
+        }
+    }
+}
+
 /// Serve DNS over UDP. Each request is handled in its own task so a slow
 /// upstream cannot head-of-line block the rest of the network.
 pub async fn serve_udp(resolver: Arc<Resolver>, listen: SocketAddr) -> Result<()> {
-    let socket = Arc::new(UdpSocket::bind(listen).await.with_context(|| {
-        format!("binding UDP {listen} (port 53 needs root or CAP_NET_BIND_SERVICE)")
-    })?);
+    let socket = Arc::new(
+        bind_with_retry(&format!("binding UDP {listen}"), BIND_RETRY_WINDOW, || {
+            UdpSocket::bind(listen)
+        })
+        .await?,
+    );
     tracing::info!("DNS listening on {listen}/udp");
 
     // 4096 covers EDNS0 payloads; larger answers arrive over TCP.
@@ -505,9 +548,10 @@ pub async fn serve_udp(resolver: Arc<Resolver>, listen: SocketAddr) -> Result<()
 
 /// Serve DNS over TCP (RFC 1035 length-prefixed framing).
 pub async fn serve_tcp(resolver: Arc<Resolver>, listen: SocketAddr) -> Result<()> {
-    let listener = TcpListener::bind(listen)
-        .await
-        .with_context(|| format!("binding TCP {listen}"))?;
+    let listener = bind_with_retry(&format!("binding TCP {listen}"), BIND_RETRY_WINDOW, || {
+        TcpListener::bind(listen)
+    })
+    .await?;
     tracing::info!("DNS listening on {listen}/tcp");
 
     loop {
@@ -589,6 +633,97 @@ mod tests {
         q.set_query_type(qtype);
         msg.add_query(q);
         msg.to_vec().unwrap()
+    }
+
+    // Paused-time tests for the boot-race bind retry. `start_paused` makes
+    // `tokio::time::sleep` advance instantly instead of burning real wall
+    // clock, so a test that simulates a 30-second retry window still runs in
+    // milliseconds.
+
+    #[tokio::test(start_paused = true)]
+    async fn bind_retry_succeeds_immediately_without_retrying() {
+        let calls = std::sync::atomic::AtomicU32::new(0);
+        let result = bind_with_retry("test", Duration::from_secs(5), || {
+            calls.fetch_add(1, Ordering::Relaxed);
+            std::future::ready(Ok::<_, std::io::Error>(42))
+        })
+        .await;
+        assert_eq!(result.unwrap(), 42);
+        assert_eq!(
+            calls.load(Ordering::Relaxed),
+            1,
+            "no retry needed, no retry taken"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn bind_retry_recovers_from_a_transient_conflict() {
+        // Simulates exactly what happened on the reporter's Pi: something else
+        // holds the port for the first couple of attempts, then lets go.
+        let calls = std::sync::atomic::AtomicU32::new(0);
+        let result = bind_with_retry("test", Duration::from_secs(30), || {
+            let n = calls.fetch_add(1, Ordering::Relaxed);
+            std::future::ready(if n < 2 {
+                Err(std::io::Error::from(std::io::ErrorKind::AddrInUse))
+            } else {
+                Ok(42)
+            })
+        })
+        .await;
+        assert_eq!(result.unwrap(), 42);
+        assert_eq!(
+            calls.load(Ordering::Relaxed),
+            3,
+            "two failures, then the successful attempt"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn bind_retry_gives_up_after_the_window_and_reports_why() {
+        let calls = std::sync::atomic::AtomicU32::new(0);
+        let result = bind_with_retry("binding UDP 0.0.0.0:53", Duration::from_millis(900), || {
+            calls.fetch_add(1, Ordering::Relaxed);
+            std::future::ready(Err::<u32, _>(std::io::Error::from(
+                std::io::ErrorKind::AddrInUse,
+            )))
+        })
+        .await;
+        let err = result.expect_err("a permanent conflict must eventually surface");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("binding UDP 0.0.0.0:53"),
+            "names what failed: {msg}"
+        );
+        assert!(
+            msg.contains("CAP_NET_BIND_SERVICE"),
+            "keeps the actionable hint: {msg}"
+        );
+        assert!(
+            calls.load(Ordering::Relaxed) >= 2,
+            "must have retried at least once"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn bind_retry_does_not_retry_permission_denied() {
+        // Permission errors (no CAP_NET_BIND_SERVICE) cannot be fixed by
+        // waiting, unlike a transient AddrInUse race — retrying would just
+        // waste the whole 30s window before reporting a problem retrying
+        // could never have solved.
+        let calls = std::sync::atomic::AtomicU32::new(0);
+        let result = bind_with_retry("test", Duration::from_secs(30), || {
+            calls.fetch_add(1, Ordering::Relaxed);
+            std::future::ready(Err::<u32, _>(std::io::Error::from(
+                std::io::ErrorKind::PermissionDenied,
+            )))
+        })
+        .await;
+        assert!(result.is_err());
+        assert_eq!(
+            calls.load(Ordering::Relaxed),
+            1,
+            "must not retry a non-AddrInUse error"
+        );
     }
 
     #[test]

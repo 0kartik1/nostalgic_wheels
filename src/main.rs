@@ -177,7 +177,14 @@ async fn main() -> Result<()> {
         let listen = cfg.dns.listen;
         tasks.push(tokio::spawn(async move {
             if let Err(e) = dns::serve_udp(r, listen).await {
-                tracing::error!("DNS/UDP server stopped: {e:#}");
+                // DNS is the entire point of this program. `serve_udp` already
+                // retries a transient bind conflict for a while on its own; if
+                // it still gives up, limping along with the dashboard and
+                // discovery workers alive but no DNS being served would look
+                // "healthy" to systemd forever while doing nothing useful. Exit
+                // instead, so the unit's `Restart=on-failure` actually engages.
+                tracing::error!("DNS/UDP server failed, exiting so systemd restarts us: {e:#}");
+                std::process::exit(1);
             }
         }));
     }
@@ -187,7 +194,8 @@ async fn main() -> Result<()> {
         let listen = cfg.dns.listen;
         tasks.push(tokio::spawn(async move {
             if let Err(e) = dns::serve_tcp(r, listen).await {
-                tracing::error!("DNS/TCP server stopped: {e:#}");
+                tracing::error!("DNS/TCP server failed, exiting so systemd restarts us: {e:#}");
+                std::process::exit(1);
             }
         }));
     }

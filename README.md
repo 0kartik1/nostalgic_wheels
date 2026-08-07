@@ -167,6 +167,19 @@ sudo systemctl restart systemd-resolved
 sudo systemctl restart netwatch
 ```
 
+**If DNS still isn't answering after a reboot specifically** (but a manual
+`systemctl restart netwatch` fixes it every time), that's a different problem:
+something else transiently holds port 53 for the first few seconds of boot —
+a DHCP client hook, NetworkManager's local resolver, etc. — and releases it
+shortly after. netwatch retries a failed bind for 30 seconds to ride this out
+on its own, so a single reboot delay usually self-heals; `journalctl -u
+netwatch` will show `address in use, retrying in ...` lines while this
+happens. If the conflict outlasts 30 seconds, netwatch exits (rather than
+running with the dashboard alive but no DNS) so systemd's `Restart=on-failure`
+retries the whole thing — check `systemctl status netwatch` for a restart
+count climbing, and `sudo ss -tulnp | grep :53` right after boot to catch
+whatever's racing it.
+
 ## Pointing your network at it
 
 Nothing is monitored until devices actually use the Pi for DNS.
