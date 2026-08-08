@@ -28,6 +28,7 @@ pub struct AppState {
     pub resolver: Arc<Resolver>,
     pub started: std::time::Instant,
     pub write_drops: Arc<db::DropCounts>,
+    pub discovery: crate::devices::SharedDiscoveryStatus,
     pub list_health: blocklist::HealthMap,
     pub refresh_lock: blocklist::RefreshLock,
 }
@@ -278,6 +279,8 @@ struct Status {
     max_udp_in_flight: usize,
     max_tcp_connections: usize,
     allow_from: Vec<String>,
+    /// Whether each passive discovery listener is off, running, or broken.
+    discovery: crate::devices::DiscoveryStatus,
     system: crate::netinfo::SystemInfo,
     gateway: Option<String>,
     lan_subnet: Option<String>,
@@ -376,6 +379,11 @@ async fn status(State(state): State<AppState>) -> ApiResult<Json<Status>> {
         max_udp_in_flight: state.cfg.dns.max_udp_in_flight,
         max_tcp_connections: state.cfg.dns.max_tcp_connections,
         allow_from: state.cfg.dns.allow_from.clone(),
+        discovery: state
+            .discovery
+            .read()
+            .map(|d| d.clone())
+            .unwrap_or_default(),
         system: crate::netinfo::system_info(),
         gateway: route.map(|r| format!("{} via {}", r.gateway, r.iface)),
         lan_subnet: lan.map(|s| s.to_string()),

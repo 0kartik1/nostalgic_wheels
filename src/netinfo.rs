@@ -258,7 +258,8 @@ pub struct SystemInfo {
     pub mem_total_kb: u64,
     pub mem_available_kb: u64,
     pub cpu_temp_c: Option<f64>,
-    /// Set when the Pi's firmware reports undervoltage or thermal throttling.
+    /// Undervoltage / throttling reported by the Pi's firmware, decoded into
+    /// words. `None` on hardware that does not expose it.
     pub throttled: Option<String>,
 }
 
@@ -298,6 +299,8 @@ pub fn system_info() -> SystemInfo {
         }
     }
 
+    info.throttled = read_throttled();
+
     // thermal_zone0 is the SoC sensor on every Pi model.
     if let Ok(s) = std::fs::read_to_string("/sys/class/thermal/thermal_zone0/temp")
         && let Ok(milli) = s.trim().parse::<f64>()
@@ -306,6 +309,58 @@ pub fn system_info() -> SystemInfo {
     }
 
     info
+}
+
+/// Decode the Raspberry Pi firmware's throttling bitmask.
+///
+/// Exposed by the vcgencmd hwmon shim at this sysfs path on current Pi OS
+/// kernels. Absent on other hardware and on older kernels, in which case we
+/// simply report nothing rather than pretending the feature exists.
+///
+/// An undervoltage warning is the single most common cause of a Pi behaving
+/// strangely, and it is invisible without this.
+fn read_throttled() -> Option<String> {
+    let raw = std::fs::read_to_string("/sys/devices/platform/soc/soc:firmware/get_throttled")
+        .ok()
+        .or_else(|| std::fs::read_to_string("/sys/class/hwmon/hwmon0/throttled").ok())?;
+    let bits = parse_throttled_bits(raw.trim())?;
+    Some(describe_throttled(bits)).filter(|s| !s.is_empty())
+}
+
+fn parse_throttled_bits(raw: &str) -> Option<u32> {
+    let hex = raw.trim().trim_start_matches("0x");
+    u32::from_str_radix(hex, 16).ok()
+}
+
+/// Bits 0-3 are happening now; bits 16-19 are "has happened since boot".
+fn describe_throttled(bits: u32) -> String {
+    let mut now = Vec::new();
+    let mut past = Vec::new();
+    for (bit, label) in [
+        (0, "undervoltage"),
+        (1, "ARM frequency capped"),
+        (2, "throttled"),
+        (3, "soft temperature limit"),
+    ] {
+        if bits & (1 << bit) != 0 {
+            now.push(label);
+        }
+        if bits & (1 << (bit + 16)) != 0 {
+            past.push(label);
+        }
+    }
+
+    let mut out = String::new();
+    if !now.is_empty() {
+        out.push_str(&format!("now: {}", now.join(", ")));
+    }
+    if !past.is_empty() {
+        if !out.is_empty() {
+            out.push_str("; ");
+        }
+        out.push_str(&format!("since boot: {}", past.join(", ")));
+    }
+    out
 }
 
 /// Measure round-trip time to a host by timing a TCP handshake.
@@ -337,6 +392,34 @@ eth0\t00000000\t0101A8C0\t0003\t0\t0\t202\t00000000\t0\t0\t0
 eth0\t0001A8C0\t00000000\t0001\t0\t0\t202\t00FFFFFF\t0\t0\t0
 wlan0\t0000FEA9\t00000000\t0001\t0\t0\t303\t0000FFFF\t0\t0\t0
 ";
+
+    #[test]
+    fn decodes_the_pi_throttling_bitmask() {
+        // Values straight from the firmware's documented bit layout.
+        assert_eq!(parse_throttled_bits("0x0"), Some(0));
+        assert_eq!(parse_throttled_bits("0x50005"), Some(0x50005));
+        assert_eq!(parse_throttled_bits("50005"), Some(0x50005), "bare hex too");
+        assert_eq!(parse_throttled_bits("nonsense"), None);
+
+        // Nothing wrong: no warning at all, rather than a reassuring string
+        // nobody asked for.
+        assert_eq!(describe_throttled(0), "");
+
+        // Undervoltage happening right now — the classic bad-PSU symptom.
+        assert_eq!(describe_throttled(0x1), "now: undervoltage");
+
+        // Happened earlier but recovered: worth surfacing, worth
+        // distinguishing from a live problem.
+        assert_eq!(describe_throttled(0x10000), "since boot: undervoltage");
+
+        // Both current and historical, multiple causes.
+        let both = describe_throttled(0x50005);
+        assert!(both.contains("now: undervoltage, throttled"), "got {both}");
+        assert!(
+            both.contains("since boot: undervoltage, throttled"),
+            "got {both}"
+        );
+    }
 
     #[test]
     fn parses_default_gateway() {

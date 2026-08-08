@@ -78,6 +78,15 @@ pub struct DiscoveryConfig {
     /// Listen for mDNS (Bonjour) announcements to learn device names.
     pub mdns: bool,
     /// Listen for DHCP requests to learn hostnames + MACs. Needs port 67.
+    ///
+    /// Off by default. Binding UDP/67 with SO_REUSEPORT is only reliably
+    /// passive when nothing else on this host serves DHCP: sockets in a
+    /// reuseport group share incoming datagrams rather than each getting a
+    /// copy. A dedicated service user makes an accidental group unlikely
+    /// (the kernel only groups sockets owned by the same UID, so a
+    /// differently-owned DHCP server makes our bind fail cleanly instead),
+    /// but "unlikely" is not a good enough guarantee to put household DHCP
+    /// at risk by default.
     pub dhcp: bool,
     /// Nudge every address in the local subnet so the kernel ARPs for it.
     /// This is what makes idle devices show up at all.
@@ -161,7 +170,7 @@ impl Default for DiscoveryConfig {
             arp: true,
             arp_interval_secs: 15,
             mdns: true,
-            dhcp: true,
+            dhcp: false,
             sweep: true,
             sweep_interval_secs: 120,
             reverse_dns: true,

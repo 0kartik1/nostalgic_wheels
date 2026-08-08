@@ -218,21 +218,47 @@ async fn main() -> Result<()> {
         )));
     }
 
+    let discovery_status: devices::SharedDiscoveryStatus = Default::default();
+
     if cfg.discovery.mdns {
         let store = device_store.clone();
+        let st = Arc::clone(&discovery_status);
         tasks.push(tokio::spawn(async move {
+            if let Ok(mut s) = st.write() {
+                s.mdns = devices::ListenerState::Active;
+            }
             // Not fatal: Avahi may already own port 5353.
             if let Err(e) = devices::mdns_listener(store).await {
                 tracing::warn!("mDNS discovery unavailable: {e:#}");
+                if let Ok(mut s) = st.write() {
+                    s.mdns = devices::ListenerState::Unavailable {
+                        reason: format!("{e:#}"),
+                    };
+                }
             }
         }));
     }
 
     if cfg.discovery.dhcp {
+        tracing::warn!(
+            "discovery.dhcp is enabled. netwatch only listens, but a UDP/67 socket \
+             shares a reuseport group with any DHCP server running as the same user, \
+             which would divert leases. Leave it off unless nothing else on this host \
+             serves DHCP."
+        );
         let store = device_store.clone();
+        let st = Arc::clone(&discovery_status);
         tasks.push(tokio::spawn(async move {
+            if let Ok(mut s) = st.write() {
+                s.dhcp = devices::ListenerState::Active;
+            }
             if let Err(e) = devices::dhcp_listener(store).await {
                 tracing::warn!("DHCP discovery unavailable: {e:#}");
+                if let Ok(mut s) = st.write() {
+                    s.dhcp = devices::ListenerState::Unavailable {
+                        reason: format!("{e:#}"),
+                    };
+                }
             }
         }));
     }
@@ -317,6 +343,7 @@ async fn main() -> Result<()> {
         resolver: Arc::clone(&resolver),
         started: std::time::Instant::now(),
         write_drops: writer.drop_counts(),
+        discovery: Arc::clone(&discovery_status),
         list_health: Arc::clone(&list_health),
         refresh_lock: Arc::clone(&refresh_lock),
     };

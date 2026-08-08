@@ -92,6 +92,29 @@ struct Inner {
     pending_names: HashMap<Ipv4Addr, String>,
 }
 
+/// Whether a passive discovery listener is running, off, or broken.
+///
+/// Without this, "no DHCP hostnames" looks identical whether the feature is
+/// disabled, failed to bind, or is simply waiting for a lease renewal.
+#[derive(Debug, Clone, Default, serde::Serialize)]
+pub struct DiscoveryStatus {
+    pub dhcp: ListenerState,
+    pub mdns: ListenerState,
+}
+
+#[derive(Debug, Clone, Default, serde::Serialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum ListenerState {
+    #[default]
+    Disabled,
+    Active,
+    Unavailable {
+        reason: String,
+    },
+}
+
+pub type SharedDiscoveryStatus = Arc<RwLock<DiscoveryStatus>>;
+
 /// Shared, cheaply cloneable device registry.
 #[derive(Clone)]
 pub struct DeviceStore {
