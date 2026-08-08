@@ -712,12 +712,53 @@ where
                 delay = (delay * 2).min(Duration::from_secs(5));
             }
             Err(e) => {
-                return Err(anyhow::Error::new(e).context(format!(
-                    "{what} (port 53 needs root or CAP_NET_BIND_SERVICE)"
-                )));
+                // EAFNOSUPPORT means the kernel has no IPv6 at all, which the
+                // usual "needs root" hint would send the operator chasing the
+                // wrong thing.
+                let hint = if e.raw_os_error() == Some(97) {
+                    "this host has no IPv6 support — unset dns.listen_v6"
+                } else {
+                    "port 53 needs root or CAP_NET_BIND_SERVICE"
+                };
+                return Err(anyhow::Error::new(e).context(format!("{what} ({hint})")));
             }
         }
     }
+}
+
+/// Create a socket for `addr`, forcing `IPV6_V6ONLY` when it is IPv6.
+///
+/// Linux defaults `net.ipv6.bindv6only` to 0, so a plain bind of `[::]:53`
+/// also claims `0.0.0.0:53`. netwatch runs the IPv4 and IPv6 listeners as two
+/// independent sockets, so that default would make whichever binds second fail
+/// with `AddrInUse` — and on a host where the sysctl is 1 it would work,
+/// giving two machines opposite behaviour from the same config. Being explicit
+/// removes the ambiguity in both directions.
+fn new_socket(addr: SocketAddr, ty: socket2::Type) -> std::io::Result<socket2::Socket> {
+    let domain = socket2::Domain::for_address(addr);
+    let sock = socket2::Socket::new(domain, ty, None)?;
+    if addr.is_ipv6() {
+        sock.set_only_v6(true)?;
+    }
+    // Without this a listener left in TIME_WAIT by the previous run blocks the
+    // restart, which is the exact case the bind retry exists to survive.
+    sock.set_reuse_address(true)?;
+    sock.set_nonblocking(true)?;
+    sock.bind(&addr.into())?;
+    Ok(sock)
+}
+
+async fn bind_udp(addr: SocketAddr) -> std::io::Result<UdpSocket> {
+    let sock = new_socket(addr, socket2::Type::DGRAM)?;
+    UdpSocket::from_std(std::net::UdpSocket::from(sock))
+}
+
+async fn bind_tcp(addr: SocketAddr) -> std::io::Result<TcpListener> {
+    let sock = new_socket(addr, socket2::Type::STREAM)?;
+    // 128 is the conventional default; excess connections are refused by the
+    // kernel, which is the same answer the semaphore gives once accepted.
+    sock.listen(128)?;
+    TcpListener::from_std(std::net::TcpListener::from(sock))
 }
 
 /// Serve DNS over UDP. Each request is handled in its own task so a slow
@@ -725,7 +766,7 @@ where
 pub async fn serve_udp(resolver: Arc<Resolver>, listen: SocketAddr) -> Result<()> {
     let socket = Arc::new(
         bind_with_retry(&format!("binding UDP {listen}"), BIND_RETRY_WINDOW, || {
-            UdpSocket::bind(listen)
+            bind_udp(listen)
         })
         .await?,
     );
@@ -792,7 +833,7 @@ pub async fn serve_udp(resolver: Arc<Resolver>, listen: SocketAddr) -> Result<()
 /// Serve DNS over TCP (RFC 1035 length-prefixed framing).
 pub async fn serve_tcp(resolver: Arc<Resolver>, listen: SocketAddr) -> Result<()> {
     let listener = bind_with_retry(&format!("binding TCP {listen}"), BIND_RETRY_WINDOW, || {
-        TcpListener::bind(listen)
+        bind_tcp(listen)
     })
     .await?;
     let conns = Arc::new(tokio::sync::Semaphore::new(resolver.max_tcp_connections()));
@@ -933,6 +974,78 @@ mod tests {
             3,
             "two failures, then the successful attempt"
         );
+    }
+
+    /// Some CI containers (and this project's own dev container) are built
+    /// without IPv6, where every AF_INET6 socket fails with EAFNOSUPPORT.
+    /// That is not a netwatch bug, so the v6 tests report it and stop rather
+    /// than failing — but only for that specific errno, so a real regression
+    /// still fails loudly.
+    fn ipv6_unavailable(e: &std::io::Error) -> bool {
+        // EAFNOSUPPORT = 97 on Linux; ADDRNOTAVAIL covers hosts with the
+        // module loaded but no addresses configured.
+        e.raw_os_error() == Some(97) || e.kind() == std::io::ErrorKind::AddrNotAvailable
+    }
+
+    /// The whole point of `new_socket`: an IPv6 listener must not also claim
+    /// the IPv4 port, or the two DNS listeners would collide on hosts where
+    /// `net.ipv6.bindv6only` is 0 (the Linux default, including Raspberry Pi
+    /// OS). If this regresses, netwatch fails to start with IPv6 enabled.
+    #[tokio::test]
+    async fn v6_and_v4_udp_listeners_coexist_on_the_same_port() {
+        // Bind v6 to an ephemeral port first, then ask for the same port on
+        // v4. A dual-stack v6 socket would have taken both and this would fail.
+        let v6 = match bind_udp("[::]:0".parse().unwrap()).await {
+            Ok(s) => s,
+            Err(e) if ipv6_unavailable(&e) => {
+                eprintln!("skipping: no IPv6 on this host ({e})");
+                return;
+            }
+            Err(e) => panic!("bind [::]:0: {e}"),
+        };
+        let port = v6.local_addr().expect("local_addr").port();
+        let v4 = bind_udp(format!("0.0.0.0:{port}").parse().unwrap()).await;
+        assert!(
+            v4.is_ok(),
+            "IPv4 bind on port {port} must succeed alongside the IPv6 listener: {:?}",
+            v4.err()
+        );
+    }
+
+    #[tokio::test]
+    async fn v6_and_v4_tcp_listeners_coexist_on_the_same_port() {
+        let v6 = match bind_tcp("[::]:0".parse().unwrap()).await {
+            Ok(s) => s,
+            Err(e) if ipv6_unavailable(&e) => {
+                eprintln!("skipping: no IPv6 on this host ({e})");
+                return;
+            }
+            Err(e) => panic!("bind [::]:0: {e}"),
+        };
+        let port = v6.local_addr().expect("local_addr").port();
+        let v4 = bind_tcp(format!("0.0.0.0:{port}").parse().unwrap()).await;
+        assert!(
+            v4.is_ok(),
+            "IPv4 bind on port {port} must succeed alongside the IPv6 listener: {:?}",
+            v4.err()
+        );
+    }
+
+    /// `bind_udp` has to produce a socket tokio can actually poll — the
+    /// handover from socket2 loses the non-blocking flag if it is not set.
+    #[tokio::test]
+    async fn bound_udp_socket_is_usable() {
+        let server = bind_udp("127.0.0.1:0".parse().unwrap()).await.unwrap();
+        let addr = server.local_addr().unwrap();
+        let client = bind_udp("127.0.0.1:0".parse().unwrap()).await.unwrap();
+        client.send_to(b"hello", addr).await.unwrap();
+
+        let mut buf = [0u8; 16];
+        let (n, _) = tokio::time::timeout(Duration::from_secs(2), server.recv_from(&mut buf))
+            .await
+            .expect("a datagram sent to a bound socket must arrive")
+            .unwrap();
+        assert_eq!(&buf[..n], b"hello");
     }
 
     #[tokio::test(start_paused = true)]

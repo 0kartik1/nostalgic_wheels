@@ -21,6 +21,16 @@ pub struct Config {
 pub struct DnsConfig {
     /// Address to serve DNS on. 0.0.0.0:53 so LAN clients can reach it.
     pub listen: SocketAddr,
+    /// Optional *additional* IPv6 address to serve DNS on, e.g. "[::]:53".
+    ///
+    /// Off by default. It is a second listener rather than a replacement:
+    /// binding `[::]:53` with the usual dual-stack behaviour would also claim
+    /// the IPv4 port, so the two listeners would fight. netwatch always sets
+    /// `IPV6_V6ONLY` on this socket to keep them independent.
+    ///
+    /// IPv6 clients are answered normally but are not attributed to a device —
+    /// see the README.
+    pub listen_v6: Option<SocketAddr>,
     /// Also answer DNS over TCP (required for large responses).
     pub enable_tcp: bool,
     /// Which clients may query us. Keywords `loopback`, `private`, `any`, or
@@ -132,6 +142,7 @@ impl Default for DnsConfig {
     fn default() -> Self {
         Self {
             listen: "0.0.0.0:53".parse().unwrap(),
+            listen_v6: None,
             enable_tcp: true,
             allow_from: vec!["loopback".to_string(), "private".to_string()],
             upstreams: vec!["1.1.1.1:53".parse().unwrap(), "9.9.9.9:53".parse().unwrap()],
@@ -240,6 +251,16 @@ impl Config {
             self.dns.max_udp_in_flight > 0 && self.dns.max_tcp_connections > 0,
             "dns.max_udp_in_flight and dns.max_tcp_connections must be greater than zero"
         );
+        // A v4 address here would bind a second socket on the same port as
+        // dns.listen and one of the two would lose the race, which is a
+        // confusing way to find out about a typo.
+        if let Some(v6) = self.dns.listen_v6 {
+            anyhow::ensure!(
+                v6.is_ipv6(),
+                "dns.listen_v6 must be an IPv6 address such as \"[::]:53\", got {v6}. \
+                 Use dns.listen for the IPv4 listener."
+            );
+        }
         // Refuse to start in the one configuration that would silently expose
         // rule-changing endpoints to the network.
         if !self.web.listen.ip().is_loopback() {
@@ -286,6 +307,78 @@ impl Config {
         self.blocking
             .state_dir
             .join(format!("lists/{hash:016x}.list"))
+    }
+}
+
+#[cfg(test)]
+mod example_config_tests {
+    use super::*;
+
+    /// deploy/install.sh copies config.example.toml straight to
+    /// /etc/netwatch/config.toml on a fresh install, so anything stale in it
+    /// is a broken first run — and `deny_unknown_fields` means a renamed key
+    /// fails to parse at all. This caught `web.listen` still being
+    /// "0.0.0.0:8080" after the dashboard moved to loopback, which would have
+    /// made every new install refuse to start for want of an admin_token.
+    #[test]
+    fn the_shipped_example_config_parses_and_validates() {
+        let text = include_str!("../config.example.toml");
+        let cfg: Config = toml::from_str(text).expect("config.example.toml must parse");
+        cfg.validate()
+            .expect("config.example.toml must be a configuration netwatch will start with");
+    }
+
+    /// The file documents itself as "every key shown with its default", so a
+    /// default that drifts away from the example is a documentation bug.
+    #[test]
+    fn the_example_matches_the_built_in_defaults() {
+        let text = include_str!("../config.example.toml");
+        let cfg: Config = toml::from_str(text).unwrap();
+        let d = Config::default();
+        assert_eq!(cfg.dns.listen, d.dns.listen);
+        assert_eq!(cfg.dns.allow_from, d.dns.allow_from);
+        assert_eq!(cfg.dns.upstream_udp_payload, d.dns.upstream_udp_payload);
+        assert_eq!(cfg.dns.max_udp_in_flight, d.dns.max_udp_in_flight);
+        assert_eq!(cfg.dns.max_tcp_connections, d.dns.max_tcp_connections);
+        assert_eq!(cfg.dns.request_timeout_ms, d.dns.request_timeout_ms);
+        assert_eq!(cfg.dns.cache_min_ttl, d.dns.cache_min_ttl);
+        assert_eq!(cfg.web.listen, d.web.listen);
+        assert_eq!(cfg.discovery.dhcp, d.discovery.dhcp);
+        assert_eq!(cfg.blocking.mode, d.blocking.mode);
+        assert_eq!(cfg.storage.retention_days, d.storage.retention_days);
+    }
+}
+
+#[cfg(test)]
+mod listener_tests {
+    use super::*;
+
+    #[test]
+    fn ipv6_listening_is_off_by_default() {
+        let c = Config::default();
+        assert!(
+            c.dns.listen_v6.is_none(),
+            "a second listener is an opt-in: most home networks hand out IPv4 DNS only"
+        );
+        assert!(c.validate().is_ok());
+    }
+
+    #[test]
+    fn an_ipv4_address_in_listen_v6_is_refused_with_the_fix() {
+        // Easy typo, and the failure mode without this check is two sockets
+        // racing for the same port — much harder to read than a startup error.
+        let mut c = Config::default();
+        c.dns.listen_v6 = Some("0.0.0.0:53".parse().unwrap());
+        let msg = format!("{:#}", c.validate().unwrap_err());
+        assert!(msg.contains("listen_v6"), "names the offending key: {msg}");
+        assert!(msg.contains("dns.listen"), "points at the fix: {msg}");
+    }
+
+    #[test]
+    fn a_real_ipv6_listener_validates() {
+        let mut c = Config::default();
+        c.dns.listen_v6 = Some("[::]:53".parse().unwrap());
+        assert!(c.validate().is_ok());
     }
 }
 

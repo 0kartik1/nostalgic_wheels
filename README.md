@@ -52,14 +52,18 @@ eavesdropping.
 includes prefetching, background sync, and connection reuse. It is an excellent
 signal, not a browsing history.
 
-**IPv6 clients are logged but not named.** Queries over IPv6 are answered and
-appear in the log by address. They get no device attribution, because Linux
-exposes the IPv4 ARP table at `/proc/net/arp` but has no equivalent file for
-IPv6 neighbours — that needs netlink, which is a dependency and a chunk of
-socket code disproportionate to the payoff here. Such clients show as bare
-addresses rather than being silently dropped. If your ISP hands out IPv6 and
-you want names, the practical answer today is to prefer IPv4 for DNS on the
-LAN.
+**IPv6 clients are logged but not named.** netwatch listens on IPv4 only by
+default; set `dns.listen_v6 = "[::]:53"` to add a second listener. It is a
+second socket rather than a dual-stack one, with `IPV6_V6ONLY` forced on, so it
+cannot accidentally claim the IPv4 port and fight the first listener.
+
+Either way, IPv6 queries are answered and appear in the log by address, but get
+no device attribution: Linux exposes the IPv4 ARP table at `/proc/net/arp` and
+has no equivalent file for IPv6 neighbours — that needs netlink, which is a
+dependency and a chunk of socket code disproportionate to the payoff here. Such
+clients show as bare addresses rather than being silently dropped. If you want
+names, the practical answer today is to hand out only the IPv4 DNS server on
+the LAN, which is what most routers do anyway.
 
 **Devices can bypass you.** A device with a hardcoded DNS server, or using
 DNS-over-HTTPS (most modern browsers, on by default in some), will not appear

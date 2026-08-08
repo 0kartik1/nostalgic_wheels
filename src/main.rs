@@ -179,9 +179,14 @@ async fn main() -> Result<()> {
     // ---- background workers ------------------------------------------------
     let mut tasks: Vec<tokio::task::JoinHandle<()>> = Vec::new();
 
-    {
+    // The IPv4 listener plus, if configured, an independent IPv6 one. They are
+    // separate sockets rather than one dual-stack socket; see `dns::new_socket`.
+    let dns_listeners: Vec<SocketAddr> = std::iter::once(cfg.dns.listen)
+        .chain(cfg.dns.listen_v6)
+        .collect();
+
+    for listen in dns_listeners.iter().copied() {
         let r = Arc::clone(&resolver);
-        let listen = cfg.dns.listen;
         tasks.push(tokio::spawn(async move {
             if let Err(e) = dns::serve_udp(r, listen).await {
                 // DNS is the entire point of this program. `serve_udp` already
@@ -196,9 +201,11 @@ async fn main() -> Result<()> {
         }));
     }
 
-    if cfg.dns.enable_tcp {
+    for listen in dns_listeners.iter().copied() {
+        if !cfg.dns.enable_tcp {
+            break;
+        }
         let r = Arc::clone(&resolver);
-        let listen = cfg.dns.listen;
         tasks.push(tokio::spawn(async move {
             if let Err(e) = dns::serve_tcp(r, listen).await {
                 tracing::error!("DNS/TCP server failed, exiting so systemd restarts us: {e:#}");

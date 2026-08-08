@@ -8,6 +8,16 @@
 # root or CAP_NET_BIND_SERVICE (the systemd unit grants the capability).
 listen = "0.0.0.0:53"
 
+# Optional second listener for IPv6 clients. Off by default; most home routers
+# hand out an IPv4 DNS server only. This is an *additional* socket, not a
+# replacement — netwatch forces IPV6_V6ONLY on it so it cannot also claim the
+# IPv4 port and collide with `listen` above.
+#
+# IPv6 clients are answered and logged normally, but appear by address rather
+# than by device name (see "IPv6 clients are logged but not named" in the
+# README).
+# listen_v6 = "[::]:53"
+
 # Answer over TCP as well. Required by spec: responses too big for UDP are
 # returned truncated, and the client then retries over TCP.
 enable_tcp = true
@@ -58,9 +68,18 @@ cache_min_ttl = 30
 cache_max_ttl = 86400
 
 [web]
-# Dashboard address. Keep this on the LAN — there is no authentication, so do
-# not port-forward it to the internet.
-listen = "0.0.0.0:8080"
+# Dashboard address. Loopback only by default: the dashboard can add block
+# rules and flush the DNS cache, so reaching it from elsewhere should be a
+# deliberate decision. The zero-configuration way in is an SSH tunnel:
+#   ssh -L 8080:localhost:8080 pi@<pi-ip>
+listen = "127.0.0.1:8080"
+
+# Shared secret for the state-changing endpoints, sent as
+#   Authorization: Bearer <token>
+# The dashboard prompts for it once and keeps it for the browser session.
+# Required whenever `listen` above is not loopback — netwatch refuses to start
+# otherwise. Generate one with: openssl rand -hex 32
+# admin_token = ""
 
 [storage]
 database = "/var/lib/netwatch/netwatch.db"
