@@ -27,25 +27,64 @@ pub struct AppState {
     pub blocklist: Arc<RwLock<Blocklist>>,
     pub resolver: Arc<Resolver>,
     pub started: std::time::Instant,
+    pub list_health: blocklist::HealthMap,
+    pub refresh_lock: blocklist::RefreshLock,
 }
 
-/// Wrap an anyhow error as a 500 with a readable body.
-struct ApiError(anyhow::Error);
+/// An API failure, carrying the status the client should see.
+///
+/// Unexpected errors become a bare 500: the detail goes to the log, not to the
+/// response, so internal paths and error chains are never exposed over HTTP.
+struct ApiError {
+    status: StatusCode,
+    /// Safe to show a client. `None` means "log it, tell them nothing".
+    public: Option<String>,
+    internal: Option<anyhow::Error>,
+}
+
+impl ApiError {
+    fn conflict(msg: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::CONFLICT,
+            public: Some(msg.into()),
+            internal: None,
+        }
+    }
+
+    fn bad_gateway(msg: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::BAD_GATEWAY,
+            public: Some(msg.into()),
+            internal: None,
+        }
+    }
+
+    fn bad_request(msg: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::BAD_REQUEST,
+            public: Some(msg.into()),
+            internal: None,
+        }
+    }
+}
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
-        tracing::error!("API error: {:#}", self.0);
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({ "error": self.0.to_string() })),
-        )
-            .into_response()
+        if let Some(e) = &self.internal {
+            tracing::error!("API error: {e:#}");
+        }
+        let body = self.public.unwrap_or_else(|| "internal error".to_string());
+        (self.status, Json(json!({ "error": body }))).into_response()
     }
 }
 
 impl<E: Into<anyhow::Error>> From<E> for ApiError {
     fn from(e: E) -> Self {
-        Self(e.into())
+        Self {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            public: None,
+            internal: Some(e.into()),
+        }
     }
 }
 
@@ -218,6 +257,8 @@ struct Status {
     blocking_mode: String,
     blocked_domains: usize,
     blocklist_sources: Vec<blocklist::SourceStat>,
+    /// Per-source download health, so a silently stale list is visible.
+    blocklist_health: Vec<blocklist::SourceHealth>,
     cache_entries: usize,
     queries_total: u64,
     queries_blocked: u64,
@@ -301,6 +342,11 @@ async fn status(State(state): State<AppState>) -> ApiResult<Json<Status>> {
         blocking_mode: state.cfg.blocking.mode.clone(),
         blocked_domains,
         blocklist_sources: sources,
+        blocklist_health: state
+            .list_health
+            .read()
+            .map(|h| h.clone())
+            .unwrap_or_default(),
         cache_entries: state.resolver.cache_len(),
         queries_total: state.resolver.stats.total.load(Ordering::Relaxed),
         queries_blocked: state.resolver.stats.blocked.load(Ordering::Relaxed),
@@ -338,23 +384,36 @@ struct DomainBody {
 }
 
 /// Rebuild the matcher from disk. Called after any list edit.
-fn rebuild(state: &AppState) -> usize {
-    let fresh = blocklist::build(&state.cfg);
+/// Rebuild the matcher from disk.
+///
+/// Parsing ~100k domains takes long enough that doing it inline would stall
+/// the executor that is also answering DNS for the whole house — clicking
+/// "Block" must not pause everyone's browsing.
+async fn rebuild(state: &AppState) -> ApiResult<usize> {
+    let cfg = Arc::clone(&state.cfg);
+    let fresh = tokio::task::spawn_blocking(move || blocklist::build(&cfg)).await?;
     let len = fresh.len();
     if let Ok(mut bl) = state.blocklist.write() {
         *bl = fresh;
     }
     // A newly blocked domain may be sitting in the cache with a real answer.
     state.resolver.flush_cache();
-    len
+    Ok(len)
 }
 
 async fn add_deny(
     State(state): State<AppState>,
     Json(body): Json<DomainBody>,
 ) -> ApiResult<Json<serde_json::Value>> {
+    // A malformed domain is the caller's mistake, not ours: 400, not 500.
+    if !blocklist::is_valid_domain(&body.domain) {
+        return Err(ApiError::bad_request(format!(
+            "{:?} is not a valid domain",
+            body.domain
+        )));
+    }
     blocklist::append_manual(&state.cfg.manual_deny_path(), &body.domain)?;
-    let n = rebuild(&state);
+    let n = rebuild(&state).await?;
     Ok(Json(json!({ "ok": true, "blocked_domains": n })))
 }
 
@@ -362,8 +421,15 @@ async fn remove_deny(
     State(state): State<AppState>,
     Json(body): Json<DomainBody>,
 ) -> ApiResult<Json<serde_json::Value>> {
+    // A malformed domain is the caller's mistake, not ours: 400, not 500.
+    if !blocklist::is_valid_domain(&body.domain) {
+        return Err(ApiError::bad_request(format!(
+            "{:?} is not a valid domain",
+            body.domain
+        )));
+    }
     blocklist::remove_manual(&state.cfg.manual_deny_path(), &body.domain)?;
-    let n = rebuild(&state);
+    let n = rebuild(&state).await?;
     Ok(Json(json!({ "ok": true, "blocked_domains": n })))
 }
 
@@ -371,8 +437,15 @@ async fn add_allow(
     State(state): State<AppState>,
     Json(body): Json<DomainBody>,
 ) -> ApiResult<Json<serde_json::Value>> {
+    // A malformed domain is the caller's mistake, not ours: 400, not 500.
+    if !blocklist::is_valid_domain(&body.domain) {
+        return Err(ApiError::bad_request(format!(
+            "{:?} is not a valid domain",
+            body.domain
+        )));
+    }
     blocklist::append_manual(&state.cfg.manual_allow_path(), &body.domain)?;
-    let n = rebuild(&state);
+    let n = rebuild(&state).await?;
     Ok(Json(json!({ "ok": true, "blocked_domains": n })))
 }
 
@@ -380,16 +453,56 @@ async fn remove_allow(
     State(state): State<AppState>,
     Json(body): Json<DomainBody>,
 ) -> ApiResult<Json<serde_json::Value>> {
+    // A malformed domain is the caller's mistake, not ours: 400, not 500.
+    if !blocklist::is_valid_domain(&body.domain) {
+        return Err(ApiError::bad_request(format!(
+            "{:?} is not a valid domain",
+            body.domain
+        )));
+    }
     blocklist::remove_manual(&state.cfg.manual_allow_path(), &body.domain)?;
-    let n = rebuild(&state);
+    let n = rebuild(&state).await?;
     Ok(Json(json!({ "ok": true, "blocked_domains": n })))
 }
 
 async fn reload(State(state): State<AppState>) -> ApiResult<Json<serde_json::Value>> {
+    // One refresh at a time: a manual reload racing the scheduled one would
+    // have both writing the same destination files.
+    let Ok(_guard) = state.refresh_lock.try_lock() else {
+        return Err(ApiError::conflict("a blocklist refresh is already running"));
+    };
+
     let cfg = Arc::clone(&state.cfg);
-    blocklist::refresh_sources(&cfg).await?;
-    let n = rebuild(&state);
-    Ok(Json(json!({ "ok": true, "blocked_domains": n })))
+    let outcome = blocklist::refresh_sources(&cfg, &state.list_health).await;
+
+    // Every source failed: say so instead of reporting a cheerful success the
+    // operator would have no reason to doubt. Cached lists are untouched, so
+    // filtering keeps working off whatever we already had.
+    if outcome.total_failure() {
+        let detail = outcome
+            .failures
+            .iter()
+            .map(|(url, why)| format!("{url}: {why}"))
+            .collect::<Vec<_>>()
+            .join("; ");
+        return Err(ApiError::bad_gateway(format!(
+            "all {} blocklist sources failed, keeping the cached copies ({detail})",
+            outcome.attempted
+        )));
+    }
+
+    let n = rebuild(&state).await?;
+    Ok(Json(json!({
+        "ok": true,
+        "blocked_domains": n,
+        "sources_attempted": outcome.attempted,
+        "sources_succeeded": outcome.succeeded,
+        "failures": outcome
+            .failures
+            .iter()
+            .map(|(url, why)| json!({ "source": url, "error": why }))
+            .collect::<Vec<_>>(),
+    })))
 }
 
 async fn flush_cache(State(state): State<AppState>) -> Json<serde_json::Value> {

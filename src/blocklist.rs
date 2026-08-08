@@ -7,6 +7,7 @@
 use anyhow::{Context, Result};
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
+use std::sync::{Arc, RwLock};
 
 /// Index into [`Blocklist::sources`].
 ///
@@ -243,42 +244,223 @@ fn normalize(entry: &str) -> Option<Entry> {
     })
 }
 
-/// Download the configured remote lists into the on-disk cache. Failures are
-/// logged, not fatal: a stale cached copy is better than no filtering.
-pub async fn refresh_sources(cfg: &crate::config::Config) -> Result<()> {
-    let dir = cfg.blocking.state_dir.join("lists");
-    std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
+/// Per-source download health, kept across refreshes so the dashboard can
+/// distinguish "never fetched" from "fetched yesterday, failing since".
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct SourceHealth {
+    pub url: String,
+    /// Unix seconds of the last attempt, successful or not.
+    pub last_attempt: Option<i64>,
+    pub last_success: Option<i64>,
+    pub bytes: Option<u64>,
+    /// One of: never_fetched, ok, stale, error.
+    pub state: &'static str,
+    /// Human-readable reason when `state` is not ok. Deliberately kept to the
+    /// protocol-level cause — never a filesystem path or internal detail.
+    pub error: Option<String>,
+}
 
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(120))
-        .user_agent(concat!("netwatch/", env!("CARGO_PKG_VERSION")))
-        .build()?;
-
-    for url in &cfg.blocking.sources {
-        let dest = cfg.cached_list_path(url);
-        match client.get(url).send().await {
-            Ok(resp) if resp.status().is_success() => match resp.text().await {
-                Ok(body) => {
-                    // Write to a temp file then rename, so a partial download
-                    // never replaces a good list.
-                    let tmp = dest.with_extension("tmp");
-                    if let Err(e) = std::fs::write(&tmp, &body) {
-                        tracing::error!("writing {}: {e}", tmp.display());
-                        continue;
-                    }
-                    if let Err(e) = std::fs::rename(&tmp, &dest) {
-                        tracing::error!("renaming into {}: {e}", dest.display());
-                        continue;
-                    }
-                    tracing::info!("downloaded blocklist {url} ({} bytes)", body.len());
-                }
-                Err(e) => tracing::error!("reading body of {url}: {e}"),
-            },
-            Ok(resp) => tracing::error!("fetching {url}: HTTP {}", resp.status()),
-            Err(e) => tracing::error!("fetching {url}: {e}"),
+impl SourceHealth {
+    fn new(url: &str) -> Self {
+        Self {
+            url: url.to_string(),
+            last_attempt: None,
+            last_success: None,
+            bytes: None,
+            state: "never_fetched",
+            error: None,
         }
     }
-    Ok(())
+}
+
+/// Shared, mutable view of how each configured source is doing.
+pub type HealthMap = Arc<RwLock<Vec<SourceHealth>>>;
+
+pub fn new_health(cfg: &crate::config::Config) -> HealthMap {
+    Arc::new(RwLock::new(
+        cfg.blocking
+            .sources
+            .iter()
+            .map(|u| SourceHealth::new(u))
+            .collect(),
+    ))
+}
+
+/// What a refresh actually achieved.
+#[derive(Debug, Default)]
+pub struct RefreshOutcome {
+    pub attempted: usize,
+    pub succeeded: usize,
+    /// (url, reason) for each source that failed.
+    pub failures: Vec<(String, String)>,
+}
+
+impl RefreshOutcome {
+    /// True when we tried to fetch something and every single one failed.
+    /// A refresh with nothing configured is not a failure.
+    pub fn total_failure(&self) -> bool {
+        self.attempted > 0 && self.succeeded == 0
+    }
+}
+
+/// Cap on a single downloaded list. StevenBlack's unified list is ~3 MB; this
+/// leaves generous headroom while stopping a hostile or misconfigured URL from
+/// filling a Pi's SD card or its memory.
+const MAX_LIST_BYTES: u64 = 64 * 1024 * 1024;
+
+/// Serialises refreshes. A manual /api/reload and the scheduled refresh must
+/// not run at once: they would fight over the same destination files.
+pub type RefreshLock = Arc<tokio::sync::Mutex<()>>;
+
+pub fn new_refresh_lock() -> RefreshLock {
+    Arc::new(tokio::sync::Mutex::new(()))
+}
+
+/// Download the configured remote lists into the on-disk cache.
+///
+/// A failing source leaves its previously cached copy untouched, so a network
+/// blip degrades to "stale lists" rather than "no filtering". The caller gets
+/// a structured outcome instead of a blanket Ok.
+pub async fn refresh_sources(cfg: &crate::config::Config, health: &HealthMap) -> RefreshOutcome {
+    let mut outcome = RefreshOutcome::default();
+
+    let dir = cfg.blocking.state_dir.join("lists");
+    if let Err(e) = std::fs::create_dir_all(&dir) {
+        tracing::error!("creating {}: {e}", dir.display());
+        // Every source will fail for the same reason; report it once per source
+        // so the dashboard shows why.
+        for url in &cfg.blocking.sources {
+            outcome.attempted += 1;
+            outcome
+                .failures
+                .push((url.clone(), "list directory is not writable".to_string()));
+        }
+        return outcome;
+    }
+
+    // reqwest is built with `rustls-no-provider`, and its client builder
+    // *panics* if no provider is installed. main() installs one, but relying
+    // on caller ordering would turn a refactor into a crash inside a spawned
+    // task, so make this module self-sufficient.
+    ensure_crypto_provider();
+
+    let client = match reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(120))
+        .user_agent(concat!("netwatch/", env!("CARGO_PKG_VERSION")))
+        .build()
+    {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::error!("building HTTP client: {e}");
+            for url in &cfg.blocking.sources {
+                outcome.attempted += 1;
+                outcome
+                    .failures
+                    .push((url.clone(), "HTTP client unavailable".to_string()));
+            }
+            return outcome;
+        }
+    };
+
+    for url in &cfg.blocking.sources {
+        outcome.attempted += 1;
+        let now = crate::db::now();
+        set_health(health, url, |h| {
+            h.last_attempt = Some(now);
+        });
+
+        match fetch_one(&client, url, &cfg.cached_list_path(url)).await {
+            Ok(bytes) => {
+                outcome.succeeded += 1;
+                tracing::info!("downloaded blocklist {url} ({bytes} bytes)");
+                set_health(health, url, |h| {
+                    h.last_success = Some(now);
+                    h.bytes = Some(bytes);
+                    h.state = "ok";
+                    h.error = None;
+                });
+            }
+            Err(e) => {
+                let reason = format!("{e:#}");
+                tracing::error!("refreshing {url}: {reason}");
+                outcome.failures.push((url.clone(), reason.clone()));
+                set_health(health, url, |h| {
+                    // A source that succeeded before is stale, not broken:
+                    // filtering still works off the cached copy.
+                    h.state = if h.last_success.is_some() {
+                        "stale"
+                    } else {
+                        "error"
+                    };
+                    h.error = Some(reason);
+                });
+            }
+        }
+    }
+
+    outcome
+}
+
+/// Install the ring crypto provider exactly once. Idempotent and cheap.
+fn ensure_crypto_provider() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        // An error here means someone else already installed one, which is
+        // exactly the outcome we want.
+        let _ = rustls::crypto::ring::default_provider().install_default();
+    });
+}
+
+fn set_health(health: &HealthMap, url: &str, f: impl FnOnce(&mut SourceHealth)) {
+    if let Ok(mut list) = health.write()
+        && let Some(entry) = list.iter_mut().find(|h| h.url == url)
+    {
+        f(entry);
+    }
+}
+
+/// Fetch one list to a temp file and rename it into place. Returns byte count.
+async fn fetch_one(client: &reqwest::Client, url: &str, dest: &Path) -> Result<u64> {
+    let resp = client.get(url).send().await.context("request failed")?;
+    let status = resp.status();
+    anyhow::ensure!(status.is_success(), "HTTP {status}");
+
+    // Reject an over-large list before downloading it when the server is
+    // honest enough to tell us up front.
+    if let Some(len) = resp.content_length() {
+        anyhow::ensure!(
+            len <= MAX_LIST_BYTES,
+            "list is {len} bytes, over the {MAX_LIST_BYTES} byte limit"
+        );
+    }
+
+    // Unique temp name in the destination directory, so a rename is atomic
+    // (same filesystem) and two concurrent refreshes cannot collide.
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let tmp = dest.with_extension(format!("tmp.{}.{seq}", std::process::id()));
+
+    // Stream so the size cap applies even when Content-Length lied or was
+    // absent, rather than buffering an unbounded body first.
+    let mut resp = resp;
+    let mut body: Vec<u8> = Vec::new();
+    while let Some(chunk) = resp.chunk().await.context("reading body")? {
+        anyhow::ensure!(
+            body.len() as u64 + chunk.len() as u64 <= MAX_LIST_BYTES,
+            "list exceeded the {MAX_LIST_BYTES} byte limit mid-download"
+        );
+        body.extend_from_slice(&chunk);
+    }
+    anyhow::ensure!(!body.is_empty(), "empty response body");
+
+    let written = body.len() as u64;
+    std::fs::write(&tmp, &body).context("writing temporary list")?;
+    if let Err(e) = std::fs::rename(&tmp, dest) {
+        // Do not leave the temp file behind on failure.
+        let _ = std::fs::remove_file(&tmp);
+        return Err(anyhow::Error::new(e).context("replacing cached list"));
+    }
+    Ok(written)
 }
 
 /// Build the in-memory matcher from every configured file + cached download,
@@ -330,6 +512,13 @@ pub fn build(cfg: &crate::config::Config) -> Blocklist {
         bl.sources.len()
     );
     bl
+}
+
+/// Whether a string is a domain we are willing to add to a manual list.
+/// Exposed so the API can reject bad input as a client error rather than
+/// discovering it as a failure deep inside a write.
+pub fn is_valid_domain(domain: &str) -> bool {
+    normalize(domain).is_some()
 }
 
 /// Append a domain to one of the manual lists, ignoring duplicates.
@@ -467,5 +656,165 @@ mod tests {
         let mut bl = Blocklist::default();
         bl.ingest("ADS.Example.COM.\n", "test", false);
         assert_eq!(bl.lookup("ads.example.com"), Some("test"));
+    }
+}
+
+#[cfg(test)]
+mod refresh_tests {
+    use super::*;
+
+    fn cfg_with(sources: Vec<String>, dir: &Path) -> crate::config::Config {
+        let mut c = crate::config::Config::default();
+        c.blocking.sources = sources;
+        c.blocking.state_dir = dir.to_path_buf();
+        c
+    }
+
+    fn tmpdir(tag: &str) -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(format!(
+            "netwatch-test-{tag}-{}-{:?}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(d.join("lists")).unwrap();
+        d
+    }
+
+    #[tokio::test]
+    async fn every_source_failing_is_reported_as_a_total_failure() {
+        let dir = tmpdir("allfail");
+        // Port 1 on loopback refuses instantly: a deterministic failure that
+        // needs no network.
+        let cfg = cfg_with(vec!["http://127.0.0.1:1/list.txt".to_string()], &dir);
+        let health = new_health(&cfg);
+
+        let outcome = refresh_sources(&cfg, &health).await;
+        assert_eq!(outcome.attempted, 1);
+        assert_eq!(outcome.succeeded, 0);
+        assert!(
+            outcome.total_failure(),
+            "must not report a cheerful success"
+        );
+        assert_eq!(outcome.failures.len(), 1);
+
+        let h = &health.read().unwrap()[0];
+        assert_eq!(h.state, "error", "never fetched, so this is an error");
+        assert!(h.last_attempt.is_some());
+        assert!(h.last_success.is_none());
+        assert!(h.error.is_some());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn a_failure_after_a_success_is_stale_and_keeps_the_cached_list() {
+        let dir = tmpdir("stale");
+        let cfg = cfg_with(vec!["http://127.0.0.1:1/list.txt".to_string()], &dir);
+        let health = new_health(&cfg);
+
+        // Pretend a previous refresh worked, and leave a cached list on disk.
+        let cached = cfg.cached_list_path(&cfg.blocking.sources[0]);
+        std::fs::create_dir_all(cached.parent().unwrap()).unwrap();
+        std::fs::write(&cached, "ads.example.com\n").unwrap();
+        set_health(&health, &cfg.blocking.sources[0], |h| {
+            h.last_success = Some(1);
+            h.state = "ok";
+        });
+
+        let outcome = refresh_sources(&cfg, &health).await;
+        assert!(outcome.total_failure());
+
+        let h = &health.read().unwrap()[0];
+        assert_eq!(
+            h.state, "stale",
+            "a previously-good source degrades, not breaks"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&cached).unwrap(),
+            "ads.example.com\n",
+            "the cached list must survive a failed refresh"
+        );
+
+        // And the matcher still blocks off that cached copy.
+        let bl = build(&cfg);
+        assert!(bl.lookup("ads.example.com").is_some());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn partial_success_is_not_a_total_failure() {
+        let dir = tmpdir("partial");
+        // One source that works (a local file server) and one that does not.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            while let Ok((mut s, _)) = listener.accept().await {
+                let mut buf = [0u8; 1024];
+                let _ = s.read(&mut buf).await;
+                let body = "0.0.0.0 tracker.example.com\n";
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = s.write_all(resp.as_bytes()).await;
+            }
+        });
+
+        let cfg = cfg_with(
+            vec![
+                format!("http://{addr}/good.txt"),
+                "http://127.0.0.1:1/bad.txt".to_string(),
+            ],
+            &dir,
+        );
+        let health = new_health(&cfg);
+        let outcome = refresh_sources(&cfg, &health).await;
+
+        assert_eq!(outcome.attempted, 2);
+        assert_eq!(outcome.succeeded, 1);
+        assert!(!outcome.total_failure(), "one good source is not a failure");
+        assert_eq!(outcome.failures.len(), 1);
+
+        let h = health.read().unwrap();
+        assert_eq!(h[0].state, "ok");
+        assert!(h[0].bytes.unwrap() > 0);
+        assert_eq!(h[1].state, "error");
+        drop(h);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn concurrent_refreshes_are_serialised_by_the_lock() {
+        let lock = new_refresh_lock();
+        let held = lock.clone().lock_owned().await;
+        // A second refresh must back off rather than run alongside the first.
+        assert!(
+            lock.try_lock().is_err(),
+            "the coordinator must refuse an overlapping refresh"
+        );
+        drop(held);
+        assert!(lock.try_lock().is_ok(), "and allow one once free");
+    }
+
+    #[tokio::test]
+    async fn temp_files_do_not_collide_and_are_cleaned_up() {
+        let dir = tmpdir("tmpfiles");
+        let cfg = cfg_with(vec!["http://127.0.0.1:1/x.txt".to_string()], &dir);
+        let health = new_health(&cfg);
+        refresh_sources(&cfg, &health).await;
+
+        let leftovers: Vec<_> = std::fs::read_dir(dir.join("lists"))
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().contains("tmp"))
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "a failed download must not leave temp files behind"
+        );
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

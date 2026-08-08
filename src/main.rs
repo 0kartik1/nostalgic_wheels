@@ -105,6 +105,8 @@ async fn main() -> Result<()> {
     tracing::info!("database at {}", cfg.storage.database.display());
 
     // ---- blocklists --------------------------------------------------------
+    let list_health = blocklist::new_health(&cfg);
+    let refresh_lock = blocklist::new_refresh_lock();
     if cfg.blocking.enabled && !cli.no_fetch {
         // Only download if we have nothing cached; otherwise start fast and let
         // the refresh task update in the background.
@@ -115,8 +117,13 @@ async fn main() -> Result<()> {
             .all(|u| cfg.cached_list_path(u).exists());
         if !have_cache {
             tracing::info!("downloading blocklists (first run)");
-            if let Err(e) = blocklist::refresh_sources(&cfg).await {
-                tracing::error!("blocklist download failed, continuing without: {e:#}");
+            let outcome = blocklist::refresh_sources(&cfg, &list_health).await;
+            if outcome.total_failure() {
+                tracing::error!(
+                    "all {} blocklist sources failed; starting without filtering. \
+                     Check connectivity and POST /api/reload to retry.",
+                    outcome.attempted
+                );
             }
         }
     }
@@ -261,21 +268,43 @@ async fn main() -> Result<()> {
         let cfg2 = Arc::clone(&cfg);
         let bl = Arc::clone(&blocklist);
         let r = Arc::clone(&resolver);
+        let health2 = Arc::clone(&list_health);
+        let lock2 = Arc::clone(&refresh_lock);
         let period = Duration::from_secs(cfg.blocking.refresh_hours * 3600);
         tasks.push(tokio::spawn(async move {
             let mut tick = tokio::time::interval(period);
             tick.tick().await; // the first tick fires immediately; skip it
             loop {
                 tick.tick().await;
-                if let Err(e) = blocklist::refresh_sources(&cfg2).await {
-                    tracing::error!("blocklist refresh failed: {e:#}");
+
+                // Skip this cycle if a manual reload holds the lock; it is
+                // doing the same work right now.
+                let Ok(_guard) = lock2.try_lock() else {
+                    tracing::debug!("scheduled refresh skipped, a manual one is running");
+                    continue;
+                };
+
+                let outcome = blocklist::refresh_sources(&cfg2, &health2).await;
+                if outcome.total_failure() {
+                    tracing::error!(
+                        "scheduled refresh: all {} sources failed, keeping cached lists",
+                        outcome.attempted
+                    );
                     continue;
                 }
-                let fresh = blocklist::build(&cfg2);
-                if let Ok(mut guard) = bl.write() {
-                    *guard = fresh;
+
+                // Parsing ~100k domains must not block the executor that is
+                // also serving DNS.
+                let cfg3 = Arc::clone(&cfg2);
+                match tokio::task::spawn_blocking(move || blocklist::build(&cfg3)).await {
+                    Ok(fresh) => {
+                        if let Ok(mut guard) = bl.write() {
+                            *guard = fresh;
+                        }
+                        r.flush_cache();
+                    }
+                    Err(e) => tracing::error!("rebuilding blocklist: {e}"),
                 }
-                r.flush_cache();
             }
         }));
     }
@@ -287,6 +316,8 @@ async fn main() -> Result<()> {
         blocklist: Arc::clone(&blocklist),
         resolver: Arc::clone(&resolver),
         started: std::time::Instant::now(),
+        list_health: Arc::clone(&list_health),
+        refresh_lock: Arc::clone(&refresh_lock),
     };
     {
         let listen = cfg.web.listen;
