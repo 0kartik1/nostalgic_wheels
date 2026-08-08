@@ -316,6 +316,7 @@ async fn main() -> Result<()> {
         blocklist: Arc::clone(&blocklist),
         resolver: Arc::clone(&resolver),
         started: std::time::Instant::now(),
+        write_drops: writer.drop_counts(),
         list_health: Arc::clone(&list_health),
         refresh_lock: Arc::clone(&refresh_lock),
     };

@@ -27,6 +27,7 @@ pub struct AppState {
     pub blocklist: Arc<RwLock<Blocklist>>,
     pub resolver: Arc<Resolver>,
     pub started: std::time::Instant,
+    pub write_drops: Arc<db::DropCounts>,
     pub list_health: blocklist::HealthMap,
     pub refresh_lock: blocklist::RefreshLock,
 }
@@ -269,6 +270,11 @@ struct Status {
     udp_overload_drops: u64,
     tcp_rejections: u64,
     request_timeouts: u64,
+    /// Events lost to a full write queue, split by kind: a dropped query means
+    /// an incomplete log, a dropped device row only a staler name.
+    dropped_query_events: u64,
+    dropped_device_events: u64,
+    dropped_monitoring_events: u64,
     max_udp_in_flight: usize,
     max_tcp_connections: usize,
     allow_from: Vec<String>,
@@ -364,6 +370,9 @@ async fn status(State(state): State<AppState>) -> ApiResult<Json<Status>> {
             .stats
             .request_timeouts
             .load(Ordering::Relaxed),
+        dropped_query_events: state.write_drops.queries.load(Ordering::Relaxed),
+        dropped_device_events: state.write_drops.devices.load(Ordering::Relaxed),
+        dropped_monitoring_events: state.write_drops.monitoring.load(Ordering::Relaxed),
         max_udp_in_flight: state.cfg.dns.max_udp_in_flight,
         max_tcp_connections: state.cfg.dns.max_tcp_connections,
         allow_from: state.cfg.dns.allow_from.clone(),

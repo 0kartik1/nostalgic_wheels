@@ -9,6 +9,7 @@ use anyhow::{Context, Result};
 use rusqlite::{Connection, params};
 use serde::Serialize;
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -150,24 +151,51 @@ pub fn open(path: &Path) -> Result<Connection> {
 /// Handle the resolver and samplers use to record data. Cloneable and cheap;
 /// sends never block the caller (bounded channel, drops under extreme load
 /// rather than stalling DNS).
+#[derive(Debug, Default)]
+pub struct DropCounts {
+    pub queries: AtomicU64,
+    pub devices: AtomicU64,
+    pub monitoring: AtomicU64,
+}
+
 #[derive(Clone)]
 pub struct Writer {
     tx: mpsc::SyncSender<WriteOp>,
+    dropped: Arc<DropCounts>,
 }
 
 impl Writer {
     pub fn send(&self, op: WriteOp) {
+        // Which kind was lost matters: dropped queries mean an incomplete log,
+        // dropped device rows only mean staler names. Counting them together
+        // would hide the difference.
+        let counter = match &op {
+            WriteOp::Query(_) => &self.dropped.queries,
+            WriteOp::Device { .. } => &self.dropped.devices,
+            WriteOp::Iface(_) | WriteOp::Latency { .. } => &self.dropped.monitoring,
+        };
         if self.tx.try_send(op).is_err() {
             // Either the queue is saturated or we are shutting down. Losing a
             // log line is strictly better than delaying a DNS answer.
-            tracing::trace!("write queue full, dropping event");
+            let n = counter.fetch_add(1, Ordering::Relaxed);
+            if n == 0 {
+                tracing::warn!(
+                    "database write queue is full; events are being dropped. \
+                     Counts are reported in /api/status."
+                );
+            }
         }
+    }
+
+    pub fn drop_counts(&self) -> Arc<DropCounts> {
+        Arc::clone(&self.dropped)
     }
 }
 
 /// Spawn the writer thread. Returns the handle used to submit rows.
 pub fn spawn_writer(conn: Connection, flush_interval: Duration, retention_days: u32) -> Writer {
     let (tx, rx) = mpsc::sync_channel::<WriteOp>(8192);
+    let dropped = Arc::new(DropCounts::default());
 
     std::thread::Builder::new()
         .name("netwatch-db".into())
@@ -210,7 +238,7 @@ pub fn spawn_writer(conn: Connection, flush_interval: Duration, retention_days: 
         })
         .expect("spawning db writer thread");
 
-    Writer { tx }
+    Writer { tx, dropped }
 }
 
 fn flush(conn: &mut Connection, ops: &[WriteOp]) -> Result<()> {
