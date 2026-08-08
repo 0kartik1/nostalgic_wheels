@@ -384,6 +384,57 @@ async function api(path, opts) {
   return r.json();
 }
 
+/* ---------------------------------------------------------------------------
+   Admin token.
+
+   Held in sessionStorage only: it is never rendered into the page source and
+   never comes back from the API, so viewing source or reading a response can
+   never reveal it. Cleared when the tab closes.
+   --------------------------------------------------------------------------- */
+const TOKEN_KEY = "netwatch-admin-token";
+
+function getToken() {
+  try { return sessionStorage.getItem(TOKEN_KEY) || ""; } catch (e) { return ""; }
+}
+function setToken(t) {
+  try { t ? sessionStorage.setItem(TOKEN_KEY, t) : sessionStorage.removeItem(TOKEN_KEY); }
+  catch (e) { /* private mode: the token just won't persist */ }
+}
+
+/** A state-changing call. Prompts for the token if the server demands one. */
+async function apiMutate(path, body) {
+  const send = (token) => fetch(path, {
+    method: "POST",
+    headers: Object.assign(
+      { "content-type": "application/json" },
+      token ? { authorization: `Bearer ${token}` } : {}
+    ),
+    body: JSON.stringify(body)
+  });
+
+  let r = await send(getToken());
+  if (r.status === 401) {
+    const entered = window.prompt(
+      "This netwatch dashboard requires an admin token for changes.\n" +
+      "It is the web.admin_token value from /etc/netwatch/config.toml."
+    );
+    if (!entered) throw new Error("a token is required to make changes");
+    setToken(entered.trim());
+    r = await send(getToken());
+    // A second rejection means the token is wrong; don't keep a bad one.
+    if (r.status === 401) {
+      setToken("");
+      throw new Error("that token was rejected");
+    }
+  }
+  if (!r.ok) {
+    let detail = `HTTP ${r.status}`;
+    try { const j = await r.json(); if (j && j.error) detail = j.error; } catch (e) { /* keep status */ }
+    throw new Error(detail);
+  }
+  return r.json();
+}
+
 function live(ok, text) {
   $("live-dot").classList.toggle("bad", !ok);
   $("live-text").textContent = text;
@@ -750,11 +801,7 @@ $("log").addEventListener("click", async (ev) => {
 async function rule(kind, domain) {
   const msg = $("rule-msg");
   try {
-    const r = await api("/api/" + (kind === "allow" ? "allow" : "deny"), {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ domain })
-    });
+    const r = await apiMutate("/api/" + (kind === "allow" ? "allow" : "deny"), { domain });
     msg.className = "note";
     msg.textContent = `${kind === "allow" ? "Allowing" : "Blocking"} ${domain}. ${num(r.blocked_domains)} rules active.`;
   } catch (e) {

@@ -29,10 +29,32 @@ allow_from = ["loopback", "private"]
 upstreams = ["1.1.1.1:53", "9.9.9.9:53"]
 upstream_timeout_ms = 2500
 
+# Largest UDP answer we ask an upstream for. 1232 is the DNS Flag Day 2020
+# value: big enough for nearly every answer, small enough to avoid IP
+# fragmentation on a 1500-byte-MTU link. Bigger answers arrive over TCP.
+upstream_udp_payload = 1232
+
+# Overload limits. Past these, netwatch sheds work rather than queueing it:
+# a dropped query is retried by the client, whereas an unbounded backlog
+# would exhaust memory and then answer questions nobody is waiting for.
+max_udp_in_flight = 128
+max_tcp_connections = 64
+
+# Ceiling on one request end to end, across every upstream attempt. Must be
+# comfortably above upstream_timeout_ms x number of upstreams.
+request_timeout_ms = 10000
+
 # Local answer cache. This is where most of the perceived speed-up comes from.
 cache = true
 cache_max_entries = 20000
+# Answers with a TTL shorter than this are simply not cached. This is a
+# threshold, NOT a floor to round up to: a cache must never serve a longer TTL
+# than the authority granted, because short TTLs are usually deliberate
+# (failover, dynamic DNS). Set to 0 to cache everything.
 cache_min_ttl = 30
+
+# Upper bound on how long an entry is retained. Records still report their own
+# TTL to clients; this only makes us re-check sooner.
 cache_max_ttl = 86400
 
 [web]
@@ -62,9 +84,18 @@ arp_interval_secs = 15
 mdns = true
 
 # Listen for DHCP requests, which carry both the MAC and the hostname the
-# device asks for. This only listens; it never answers, so your router stays
-# the only DHCP server on the network.
-dhcp = true
+# device asks for. netwatch only listens and never answers.
+#
+# OFF by default. A UDP/67 socket joins a SO_REUSEPORT group with any other
+# socket on this host bound to the same port by the same user, and a reuseport
+# group *shares* incoming datagrams rather than each member getting a copy.
+# The dedicated service user makes that unlikely (a differently-owned DHCP
+# server just makes our bind fail cleanly), but losing household DHCP is far
+# worse than losing hostname enrichment, so this is opt-in.
+#
+# Safe to enable when nothing else on this Pi serves DHCP. Check with:
+#   sudo ss -ulnp | grep :67
+dhcp = false
 
 # Send one harmless UDP probe to each address in the LAN so the kernel resolves
 # its MAC. Without this, devices that are idle never appear at all.

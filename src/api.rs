@@ -9,8 +9,9 @@ use crate::config::Config;
 use crate::db::{self, ReadHandle};
 use crate::dns::Resolver;
 use anyhow::Result;
-use axum::extract::{Query, State};
-use axum::http::{StatusCode, header};
+use axum::extract::{DefaultBodyLimit, Query, Request, State};
+use axum::http::{HeaderValue, StatusCode, header};
+use axum::middleware::{self, Next};
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
@@ -57,6 +58,14 @@ impl ApiError {
         Self {
             status: StatusCode::BAD_GATEWAY,
             public: Some(msg.into()),
+            internal: None,
+        }
+    }
+
+    fn unauthorized() -> Self {
+        Self {
+            status: StatusCode::UNAUTHORIZED,
+            public: Some("a valid admin token is required".to_string()),
             internal: None,
         }
     }
@@ -109,8 +118,25 @@ where
     Ok(out)
 }
 
+/// The only bodies this API accepts are `{"domain": "..."}`. Anything larger
+/// is a mistake or an attempt to make us allocate.
+const MAX_BODY_BYTES: usize = 16 * 1024;
+
+/// Ceiling on one HTTP request. The heaviest handler is a blocklist rebuild.
+const HTTP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
 pub fn router(state: AppState) -> Router {
-    Router::new()
+    // Anything that changes resolver behaviour: block rules, cache, lists.
+    let mutating = Router::new()
+        .route("/api/deny", post(add_deny).delete(remove_deny))
+        .route("/api/allow", post(add_allow).delete(remove_allow))
+        .route("/api/reload", post(reload))
+        .route("/api/flush-cache", post(flush_cache))
+        .route_layer(middleware::from_fn_with_state(state.clone(), require_admin));
+
+    // Read-only. Left open so the dashboard renders without a token; none of
+    // it can change what the network resolves.
+    let readonly = Router::new()
         .route("/", get(index))
         .route("/favicon.svg", get(favicon))
         .route("/api/summary", get(summary))
@@ -122,12 +148,90 @@ pub fn router(state: AppState) -> Router {
         .route("/api/timeseries", get(timeseries))
         .route("/api/devices", get(devices))
         .route("/api/interfaces", get(interfaces))
-        .route("/api/status", get(status))
-        .route("/api/deny", post(add_deny).delete(remove_deny))
-        .route("/api/allow", post(add_allow).delete(remove_allow))
-        .route("/api/reload", post(reload))
-        .route("/api/flush-cache", post(flush_cache))
+        .route("/api/status", get(status));
+
+    readonly
+        .merge(mutating)
+        .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
+        .layer(middleware::from_fn(deadline))
+        .layer(middleware::from_fn(security_headers))
         .with_state(state)
+}
+
+/// Reject a state-changing request that does not carry the admin token.
+///
+/// When no token is configured the dashboard is loopback-only (config
+/// validation guarantees it), so local access is the authorisation.
+async fn require_admin(
+    State(state): State<AppState>,
+    request: Request,
+    next: Next,
+) -> Result<Response, ApiError> {
+    let Some(expected) = state.cfg.web.admin_token.as_deref() else {
+        return Ok(next.run(request).await);
+    };
+
+    let presented = request
+        .headers()
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .unwrap_or("");
+
+    if !constant_time_eq(presented.as_bytes(), expected.as_bytes()) {
+        // Deliberately terse: no hint about whether the header was missing,
+        // malformed, or simply wrong.
+        return Err(ApiError::unauthorized());
+    }
+    Ok(next.run(request).await)
+}
+
+/// Compare without leaking length or content through timing.
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+}
+
+/// Cap how long any one request may occupy a connection.
+async fn deadline(request: Request, next: Next) -> Response {
+    match tokio::time::timeout(HTTP_TIMEOUT, next.run(request)).await {
+        Ok(r) => r,
+        Err(_) => (
+            StatusCode::GATEWAY_TIMEOUT,
+            Json(json!({ "error": "request timed out" })),
+        )
+            .into_response(),
+    }
+}
+
+/// The dashboard is entirely self-contained, so it can be locked down hard:
+/// no external loads, no framing, no referrer leakage.
+async fn security_headers(request: Request, next: Next) -> Response {
+    let mut resp = next.run(request).await;
+    let h = resp.headers_mut();
+    // 'unsafe-inline' is required because the page ships its CSS and JS inline
+    // by design (it must work with no network); everything external is still
+    // blocked, which is the risk that matters here.
+    h.insert(
+        header::CONTENT_SECURITY_POLICY,
+        HeaderValue::from_static(
+            "default-src 'self'; script-src 'self' 'unsafe-inline'; \
+             style-src 'self' 'unsafe-inline'; img-src 'self' data:; \
+             connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'",
+        ),
+    );
+    h.insert(
+        header::X_CONTENT_TYPE_OPTIONS,
+        HeaderValue::from_static("nosniff"),
+    );
+    h.insert(
+        header::REFERRER_POLICY,
+        HeaderValue::from_static("no-referrer"),
+    );
+    h.insert("X-Frame-Options", HeaderValue::from_static("DENY"));
+    resp
 }
 
 async fn index() -> impl IntoResponse {
@@ -532,4 +636,43 @@ pub async fn serve(state: AppState, listen: SocketAddr) -> Result<()> {
     tracing::info!("dashboard listening on http://{listen}");
     axum::serve(listener, router(state)).await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod auth_tests {
+    use super::*;
+
+    #[test]
+    fn token_comparison_is_length_safe_and_correct() {
+        assert!(constant_time_eq(b"abc", b"abc"));
+        assert!(!constant_time_eq(b"abc", b"abd"));
+        assert!(
+            !constant_time_eq(b"abc", b"ab"),
+            "length mismatch is a mismatch"
+        );
+        assert!(!constant_time_eq(b"", b"x"));
+        assert!(constant_time_eq(b"", b""));
+        // A prefix of the real token must not be accepted.
+        assert!(!constant_time_eq(b"secret", b"secret-longer"));
+    }
+
+    #[test]
+    fn an_unauthorized_reply_says_nothing_useful_to_an_attacker() {
+        let err = ApiError::unauthorized();
+        assert_eq!(err.status, StatusCode::UNAUTHORIZED);
+        let msg = err.public.unwrap();
+        // No hint about whether the header was absent, malformed or wrong.
+        assert_eq!(msg, "a valid admin token is required");
+    }
+
+    #[test]
+    fn unexpected_errors_do_not_leak_internal_detail() {
+        let err: ApiError = anyhow::anyhow!("/var/lib/netwatch/secret.db is corrupt").into();
+        assert_eq!(err.status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(
+            err.public.is_none(),
+            "internal paths must go to the log, never the response body"
+        );
+        assert!(err.internal.is_some(), "but must still be logged");
+    }
 }

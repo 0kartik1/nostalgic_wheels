@@ -56,7 +56,18 @@ pub struct DnsConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct WebConfig {
+    /// Dashboard address. Loopback by default: the dashboard can add block
+    /// rules and flush the cache, so it is not something to expose to a whole
+    /// LAN without a deliberate decision.
     pub listen: SocketAddr,
+    /// Shared secret required by the state-changing endpoints as
+    /// `Authorization: Bearer <token>`.
+    ///
+    /// Required whenever `listen` is not loopback — an off-host dashboard with
+    /// no authentication lets anyone who can reach the port rewrite the
+    /// network's DNS policy. Read-only endpoints stay open so the dashboard
+    /// still renders without it.
+    pub admin_token: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -149,7 +160,8 @@ impl Default for DnsConfig {
 impl Default for WebConfig {
     fn default() -> Self {
         Self {
-            listen: "0.0.0.0:8080".parse().unwrap(),
+            listen: "127.0.0.1:8080".parse().unwrap(),
+            admin_token: None,
         }
     }
 }
@@ -228,6 +240,23 @@ impl Config {
             self.dns.max_udp_in_flight > 0 && self.dns.max_tcp_connections > 0,
             "dns.max_udp_in_flight and dns.max_tcp_connections must be greater than zero"
         );
+        // Refuse to start in the one configuration that would silently expose
+        // rule-changing endpoints to the network.
+        if !self.web.listen.ip().is_loopback() {
+            let token_ok = self
+                .web
+                .admin_token
+                .as_deref()
+                .is_some_and(|t| t.trim().len() >= 16);
+            anyhow::ensure!(
+                token_ok,
+                "web.listen is {} (not loopback), so web.admin_token must be set to at \
+                 least 16 characters. The dashboard can add block rules and flush the \
+                 DNS cache, so it must not be reachable off-host unauthenticated. \
+                 Generate one with: openssl rand -hex 32",
+                self.web.listen
+            );
+        }
         anyhow::ensure!(
             matches!(self.blocking.mode.as_str(), "zero_ip" | "nxdomain"),
             "blocking.mode must be \"zero_ip\" or \"nxdomain\", got {:?}",
@@ -257,5 +286,56 @@ impl Config {
         self.blocking
             .state_dir
             .join(format!("lists/{hash:016x}.list"))
+    }
+}
+
+#[cfg(test)]
+mod web_auth_tests {
+    use super::*;
+
+    fn cfg(listen: &str, token: Option<&str>) -> Config {
+        let mut c = Config::default();
+        c.web.listen = listen.parse().unwrap();
+        c.web.admin_token = token.map(|t| t.to_string());
+        c
+    }
+
+    #[test]
+    fn the_default_dashboard_is_loopback_only() {
+        let c = Config::default();
+        assert!(
+            c.web.listen.ip().is_loopback(),
+            "a dashboard that can rewrite DNS policy must not default to the LAN"
+        );
+        assert!(c.validate().is_ok(), "and needs no token to work locally");
+    }
+
+    #[test]
+    fn exposing_the_dashboard_without_a_token_is_refused_at_startup() {
+        let err = cfg("0.0.0.0:8080", None).validate().unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("admin_token"),
+            "must name the missing setting: {msg}"
+        );
+        assert!(msg.contains("openssl rand"), "and say how to fix it: {msg}");
+
+        // A token too short to be worth anything is not a token.
+        assert!(cfg("0.0.0.0:8080", Some("hunter2")).validate().is_err());
+        assert!(cfg("192.168.1.5:8080", Some("   ")).validate().is_err());
+    }
+
+    #[test]
+    fn exposing_the_dashboard_with_a_real_token_is_allowed() {
+        let c = cfg("0.0.0.0:8080", Some("0123456789abcdef0123456789abcdef"));
+        assert!(c.validate().is_ok());
+    }
+
+    #[test]
+    fn a_token_on_loopback_is_honoured_rather_than_ignored() {
+        // Setting one locally is a deliberate choice; it must still apply.
+        let c = cfg("127.0.0.1:8080", Some("0123456789abcdef0123456789abcdef"));
+        assert!(c.validate().is_ok());
+        assert!(c.web.admin_token.is_some());
     }
 }
