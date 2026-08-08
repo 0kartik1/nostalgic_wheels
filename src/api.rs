@@ -383,6 +383,8 @@ struct Status {
     max_udp_in_flight: usize,
     max_tcp_connections: usize,
     allow_from: Vec<String>,
+    /// Database and sidecar file sizes, plus whether space can be reclaimed.
+    storage: db::StorageSizes,
     /// Whether each passive discovery listener is off, running, or broken.
     discovery: crate::devices::DiscoveryStatus,
     system: crate::netinfo::SystemInfo,
@@ -414,6 +416,8 @@ struct LatencyStatus {
 
 async fn status(State(state): State<AppState>) -> ApiResult<Json<Status>> {
     let latency = with_db(&state, db::latest_latency).await?;
+    let db_path = state.cfg.storage.database.clone();
+    let storage = with_db(&state, move |c| Ok(db::storage_sizes(c, &db_path))).await?;
     let route = crate::netinfo::default_route();
     let lan = route
         .as_ref()
@@ -483,6 +487,7 @@ async fn status(State(state): State<AppState>) -> ApiResult<Json<Status>> {
         max_udp_in_flight: state.cfg.dns.max_udp_in_flight,
         max_tcp_connections: state.cfg.dns.max_tcp_connections,
         allow_from: state.cfg.dns.allow_from.clone(),
+        storage,
         discovery: state
             .discovery
             .read()

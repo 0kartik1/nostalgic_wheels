@@ -86,6 +86,11 @@ pub enum WriteOp {
 }
 
 const SCHEMA: &str = r#"
+-- MUST come first. auto_vacuum can only be set while the database file has no
+-- header yet, and `PRAGMA journal_mode = WAL` writes one — so setting these in
+-- the other order silently leaves auto_vacuum at NONE and every later
+-- incremental_vacuum becomes a no-op. Verified by test.
+PRAGMA auto_vacuum = INCREMENTAL;
 PRAGMA journal_mode = WAL;
 PRAGMA synchronous = NORMAL;
 
@@ -146,6 +151,57 @@ pub fn open(path: &Path) -> Result<Connection> {
     conn.execute_batch(SCHEMA).context("applying schema")?;
     conn.busy_timeout(Duration::from_secs(5))?;
     Ok(conn)
+}
+
+/// Whether this database can return free pages to the filesystem on its own.
+///
+/// `auto_vacuum` can only be turned on for an empty database, so one created
+/// before that pragma was added stays at NONE forever. Deleting rows then
+/// frees pages inside the file without ever shrinking it. We report the
+/// situation instead of silently running a full `VACUUM` at startup, which on
+/// a multi-hundred-megabyte database on an SD card would block for minutes
+/// with the service apparently hung.
+pub fn incremental_vacuum_available(conn: &Connection) -> bool {
+    conn.query_row("PRAGMA auto_vacuum", [], |r| r.get::<_, i64>(0))
+        .map(|mode| mode == 2) // 0=NONE, 1=FULL, 2=INCREMENTAL
+        .unwrap_or(false)
+}
+
+/// Size of the database and its sidecar files.
+#[derive(Debug, Clone, Copy, Default, Serialize)]
+pub struct StorageSizes {
+    pub db_bytes: u64,
+    pub wal_bytes: u64,
+    pub shm_bytes: u64,
+    /// Space already freed inside the file, reclaimable by incremental vacuum.
+    pub free_bytes: u64,
+    pub incremental_vacuum: bool,
+}
+
+pub fn storage_sizes(conn: &Connection, path: &Path) -> StorageSizes {
+    let size_of = |p: std::path::PathBuf| std::fs::metadata(p).map(|m| m.len()).unwrap_or(0);
+    let sidecar = |suffix: &str| {
+        let mut s = path.as_os_str().to_os_string();
+        s.push(suffix);
+        std::path::PathBuf::from(s)
+    };
+
+    let page_size: u64 = conn
+        .query_row("PRAGMA page_size", [], |r| r.get::<_, i64>(0))
+        .unwrap_or(0)
+        .max(0) as u64;
+    let free_pages: u64 = conn
+        .query_row("PRAGMA freelist_count", [], |r| r.get::<_, i64>(0))
+        .unwrap_or(0)
+        .max(0) as u64;
+
+    StorageSizes {
+        db_bytes: size_of(path.to_path_buf()),
+        wal_bytes: size_of(sidecar("-wal")),
+        shm_bytes: size_of(sidecar("-shm")),
+        free_bytes: page_size * free_pages,
+        incremental_vacuum: incremental_vacuum_available(conn),
+    }
 }
 
 /// Handle the resolver and samplers use to record data. Cloneable and cheap;
@@ -231,6 +287,11 @@ pub fn spawn_writer(conn: Connection, flush_interval: Duration, retention_days: 
                     last_prune = std::time::Instant::now();
                     if let Err(e) = prune(&conn, retention_days) {
                         tracing::error!("retention prune failed: {e:#}");
+                    }
+                    // Runs on the writer thread, right after a prune, so it
+                    // never competes with a flush and never blocks DNS.
+                    if let Err(e) = maintain(&conn) {
+                        tracing::warn!("database maintenance: {e:#}");
                     }
                 }
             }
@@ -327,6 +388,39 @@ fn prune(conn: &Connection, retention_days: u32) -> Result<()> {
     conn.execute("DELETE FROM latency WHERE ts < ?1", params![iface_cutoff])?;
     if q > 0 {
         tracing::info!("pruned {q} query rows older than {retention_days}d");
+    }
+    Ok(())
+}
+
+/// Hand freed pages back to the filesystem and keep the WAL from growing
+/// without bound.
+///
+/// Deliberately incremental: a bounded number of pages per pass, so this is
+/// milliseconds rather than the multi-minute exclusive lock a full VACUUM
+/// would take on an SD card.
+fn maintain(conn: &Connection) -> Result<()> {
+    if incremental_vacuum_available(conn) {
+        // 2048 pages ~= 8 MB at the default page size: enough to keep up with
+        // an hour of pruning, small enough to stay quick.
+        //
+        // This must be *stepped*, not run through execute_batch. The pragma
+        // reclaims one page per step, so execute_batch — which steps once —
+        // silently frees a single 4 KB page and looks like it worked. Measured:
+        // stepping to completion took a pruned 3496 KB database down to 60 KB
+        // where execute_batch managed 3492 KB.
+        let mut stmt = conn
+            .prepare("PRAGMA incremental_vacuum(2048)")
+            .context("preparing incremental vacuum")?;
+        let mut rows = stmt.query([]).context("incremental vacuum")?;
+        while rows.next().context("incremental vacuum")?.is_some() {}
+    }
+
+    // Must come *after* the vacuum: the page moves land in the WAL first, so
+    // the main file only actually shrinks once they are checkpointed back
+    // into it. TRUNCATE also resets the WAL rather than leaving it at its
+    // high-water mark, which on a Pi is often tens of idle megabytes.
+    if let Err(e) = conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_| Ok(())) {
+        tracing::debug!("wal checkpoint: {e}");
     }
     Ok(())
 }
@@ -814,5 +908,113 @@ mod tests {
         assert_eq!(s.cached_24h, 1);
         assert_eq!(s.clients_24h, 2);
         assert!((s.block_percent - 50.0).abs() < 0.01);
+    }
+}
+
+#[cfg(test)]
+mod maintenance_tests {
+    use super::*;
+
+    fn temp_db(tag: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "netwatch-maint-{tag}-{}-{}.db",
+            std::process::id(),
+            now()
+        ))
+    }
+
+    #[test]
+    fn a_new_database_can_reclaim_space_after_pruning() {
+        let path = temp_db("reclaim");
+        let mut conn = open(&path).unwrap();
+        assert!(
+            incremental_vacuum_available(&conn),
+            "new databases must be created with incremental auto_vacuum"
+        );
+
+        // Write enough rows that the file is meaningfully larger than empty.
+        let old = now() - 90 * 86_400;
+        let ops: Vec<WriteOp> = (0..20_000)
+            .map(|i| {
+                WriteOp::Query(QueryEvent {
+                    ts: old,
+                    client_ip: "192.168.1.5".into(),
+                    domain: format!("host{i}.example.com"),
+                    qtype: "A".into(),
+                    status: QueryStatus::Forwarded,
+                    elapsed_ms: Some(5),
+                    answer: Some("104.21.1.1".into()),
+                    blocklist: None,
+                })
+            })
+            .collect();
+        flush(&mut conn, &ops).unwrap();
+        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")
+            .unwrap();
+        let grown = storage_sizes(&conn, &path).db_bytes;
+        assert!(
+            grown > 400_000,
+            "fixture should produce a sizeable db, got {grown}"
+        );
+
+        // Everything is older than the retention window.
+        prune(&conn, 14).unwrap();
+        let before_vacuum = storage_sizes(&conn, &path);
+        assert!(
+            before_vacuum.free_bytes > 0,
+            "deleting rows frees pages inside the file but does not shrink it"
+        );
+
+        maintain(&conn).unwrap();
+        let after = storage_sizes(&conn, &path);
+        println!(
+            "  db {} KB -> {} KB after pruning + incremental vacuum ({} KB reclaimable before)",
+            grown / 1024,
+            after.db_bytes / 1024,
+            before_vacuum.free_bytes / 1024
+        );
+        // Not just "smaller" — most of the file must actually come back.
+        // A one-page reclaim would satisfy `<` while achieving nothing.
+        assert!(
+            after.db_bytes < grown / 2,
+            "maintenance must return most of the space: {} -> {}",
+            grown,
+            after.db_bytes
+        );
+        assert_eq!(after.free_bytes, 0, "the freelist should be drained");
+        assert!(
+            after.free_bytes < before_vacuum.free_bytes,
+            "reclaimable space should drop after an incremental vacuum"
+        );
+
+        drop(conn);
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
+        }
+    }
+
+    #[test]
+    fn maintenance_is_harmless_on_a_legacy_database() {
+        // A database created before auto_vacuum was set keeps NONE forever.
+        // Maintenance must degrade to a WAL checkpoint, not error or hang.
+        let path = temp_db("legacy");
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch("PRAGMA journal_mode = WAL; PRAGMA auto_vacuum = NONE;")
+            .unwrap();
+        conn.execute_batch(SCHEMA).ok(); // auto_vacuum pragma is a no-op here
+
+        assert!(
+            !incremental_vacuum_available(&conn),
+            "an existing database cannot be switched to incremental in place"
+        );
+        maintain(&conn).expect("must still succeed, just without reclaiming");
+
+        let sizes = storage_sizes(&conn, &path);
+        assert!(!sizes.incremental_vacuum, "and must report that honestly");
+
+        drop(conn);
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
+        }
     }
 }

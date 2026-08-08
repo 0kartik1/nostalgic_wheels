@@ -859,6 +859,16 @@ function renderStatus(st) {
     ["Shed load", (st.udp_overload_drops || st.tcp_rejections || st.request_timeouts)
       ? `<span style="color:var(--warning)">${num(st.udp_overload_drops)} udp dropped · ${num(st.tcp_rejections)} tcp refused · ${num(st.request_timeouts)} timed out</span>`
       : `none (limits ${num(st.max_udp_in_flight)} udp / ${num(st.max_tcp_connections)} tcp)`],
+    ["Storage", (() => {
+      const st2 = st.storage;
+      if (!st2) return "—";
+      const parts = [`${bytes(st2.db_bytes)} db`, `${bytes(st2.wal_bytes)} wal`];
+      if (st2.free_bytes) parts.push(`${bytes(st2.free_bytes)} reclaimable`);
+      if (!st2.incremental_vacuum) {
+        parts.push('<span style="color:var(--text-muted)" title="This database predates incremental vacuum. Deleted rows free space inside the file but do not shrink it. See the README for the one-off rebuild.">fixed size</span>');
+      }
+      return parts.join(" · ");
+    })()],
     ["Write drops", (st.dropped_query_events || st.dropped_device_events || st.dropped_monitoring_events)
       ? `<span style="color:var(--warning)">${num(st.dropped_query_events)} queries · ${num(st.dropped_device_events)} devices · ${num(st.dropped_monitoring_events)} monitoring</span>`
       : "none"],
