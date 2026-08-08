@@ -35,6 +35,12 @@ pub struct Stats {
     pub upstream_errors: AtomicU64,
     /// Queries dropped because the source was not in `dns.allow_from`.
     pub denied: AtomicU64,
+    /// UDP queries dropped because `dns.max_udp_in_flight` was reached.
+    pub udp_overload_drops: AtomicU64,
+    /// TCP connections closed at accept because the limit was reached.
+    pub tcp_rejections: AtomicU64,
+    /// Requests abandoned at `dns.request_timeout_ms`.
+    pub request_timeouts: AtomicU64,
 }
 
 pub struct Resolver {
@@ -110,6 +116,40 @@ impl Resolver {
         false
     }
 
+    pub fn max_udp_in_flight(&self) -> usize {
+        self.cfg.max_udp_in_flight
+    }
+
+    pub fn max_tcp_connections(&self) -> usize {
+        self.cfg.max_tcp_connections
+    }
+
+    /// Record a UDP query shed because we were already at capacity.
+    pub fn note_udp_overload(&self) {
+        let n = self
+            .stats
+            .udp_overload_drops
+            .fetch_add(1, Ordering::Relaxed);
+        // Loud once, then quiet: an overload produces a lot of these.
+        if n == 0 {
+            tracing::warn!(
+                "at dns.max_udp_in_flight ({}); shedding queries until it clears. \
+                 Raise the limit if this is normal load rather than a misbehaving device.",
+                self.cfg.max_udp_in_flight
+            );
+        }
+    }
+
+    pub fn note_tcp_rejection(&self) {
+        let n = self.stats.tcp_rejections.fetch_add(1, Ordering::Relaxed);
+        if n == 0 {
+            tracing::warn!(
+                "at dns.max_tcp_connections ({}); refusing new DNS/TCP connections",
+                self.cfg.max_tcp_connections
+            );
+        }
+    }
+
     /// Largest UDP payload we are prepared to put on the wire or reassemble.
     pub fn udp_payload_limit(&self) -> u16 {
         self.cfg.upstream_udp_payload
@@ -134,6 +174,34 @@ impl Resolver {
     /// Errors are converted into DNS-level failures rather than propagated: a
     /// resolver that stops answering takes the whole network down with it.
     pub async fn handle(&self, request: &[u8], client: SocketAddr) -> Option<Vec<u8>> {
+        // A single budget for the whole request, not per upstream attempt.
+        // Without this, N upstreams each timing out could hold a permit for
+        // N * upstream_timeout_ms and starve everyone else during an outage.
+        let budget = Duration::from_millis(self.cfg.request_timeout_ms);
+        match tokio::time::timeout(budget, self.handle_inner(request, client)).await {
+            Ok(out) => out,
+            Err(_) => {
+                let n = self.stats.request_timeouts.fetch_add(1, Ordering::Relaxed);
+                if n == 0 {
+                    tracing::warn!(
+                        "a request from {client} exceeded dns.request_timeout_ms ({} ms); \
+                         answering SERVFAIL. Further timeouts are counted in /api/status.",
+                        self.cfg.request_timeout_ms
+                    );
+                }
+                // Tell the client rather than going silent: it can fail over
+                // to its secondary resolver immediately instead of waiting.
+                let msg = Message::from_vec(request).ok()?;
+                encode(&error_response(
+                    &msg,
+                    ResponseCode::ServFail,
+                    self.cfg.upstream_udp_payload,
+                ))
+            }
+        }
+    }
+
+    async fn handle_inner(&self, request: &[u8], client: SocketAddr) -> Option<Vec<u8>> {
         self.stats.total.fetch_add(1, Ordering::Relaxed);
         let payload_limit = self.cfg.upstream_udp_payload;
 
@@ -662,7 +730,15 @@ pub async fn serve_udp(resolver: Arc<Resolver>, listen: SocketAddr) -> Result<()
         .await?,
     );
     let payload_limit = resolver.udp_payload_limit();
-    tracing::info!("DNS listening on {listen}/udp");
+    // Bounds how much work can exist at once. Dropping is the right response
+    // to saturation for UDP: the client retries, whereas an unbounded backlog
+    // of tasks would consume memory until the Pi died and would be answering
+    // stale questions by the time it drained.
+    let in_flight = Arc::new(tokio::sync::Semaphore::new(resolver.max_udp_in_flight()));
+    tracing::info!(
+        "DNS listening on {listen}/udp (max {} in flight)",
+        resolver.max_udp_in_flight()
+    );
 
     // 4096 covers EDNS0 payloads; larger answers arrive over TCP.
     let mut buf = vec![0u8; 4096];
@@ -680,10 +756,21 @@ pub async fn serve_udp(resolver: Arc<Resolver>, listen: SocketAddr) -> Result<()
             continue;
         }
 
+        // Acquire before allocating or spawning, so an overload costs us
+        // nothing but the recv we already did.
+        let Ok(permit) = Arc::clone(&in_flight).try_acquire_owned() else {
+            resolver.note_udp_overload();
+            continue;
+        };
+
         let request = buf[..len].to_vec();
         let resolver = Arc::clone(&resolver);
         let socket = Arc::clone(&socket);
         tokio::spawn(async move {
+            // Held for the whole request, released on every exit path
+            // including panics, because it is owned by this task.
+            let _permit = permit;
+
             let Some(response) = resolver.handle(&request, peer).await else {
                 return;
             };
@@ -708,7 +795,11 @@ pub async fn serve_tcp(resolver: Arc<Resolver>, listen: SocketAddr) -> Result<()
         TcpListener::bind(listen)
     })
     .await?;
-    tracing::info!("DNS listening on {listen}/tcp");
+    let conns = Arc::new(tokio::sync::Semaphore::new(resolver.max_tcp_connections()));
+    tracing::info!(
+        "DNS listening on {listen}/tcp (max {} connections)",
+        resolver.max_tcp_connections()
+    );
 
     loop {
         let (mut stream, peer) = match listener.accept().await {
@@ -724,10 +815,20 @@ pub async fn serve_tcp(resolver: Arc<Resolver>, listen: SocketAddr) -> Result<()
             continue;
         }
 
+        // Over the limit: drop the accepted stream, which closes it. Better a
+        // clear refusal the client can retry than an unbounded pile of idle
+        // connections each holding a task and buffers.
+        let Ok(permit) = Arc::clone(&conns).try_acquire_owned() else {
+            resolver.note_tcp_rejection();
+            continue;
+        };
+
         let resolver = Arc::clone(&resolver);
 
         tokio::spawn(async move {
             use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            // Released when the connection ends, however it ends.
+            let _permit = permit;
 
             // Bound how long a single connection can sit idle holding a task.
             let session = async {
@@ -1139,6 +1240,141 @@ mod tests {
             original,
             "no re-encode when no clamping is needed"
         );
+    }
+
+    #[tokio::test]
+    async fn udp_saturation_sheds_work_instead_of_queueing_it() {
+        // Point at a black-hole upstream so every request stays in flight,
+        // then send far more queries than the limit allows. The property
+        // under test is that the excess is *dropped*, not accumulated.
+        let blackhole = TokioUdp::bind("127.0.0.1:0").await.unwrap();
+        let upstream = blackhole.local_addr().unwrap();
+        // Never reply.
+        tokio::spawn(async move {
+            let mut buf = vec![0u8; 512];
+            loop {
+                let _ = blackhole.recv_from(&mut buf).await;
+            }
+        });
+
+        let mut cfg = crate::config::Config::default();
+        cfg.dns.listen = "127.0.0.1:0".parse().unwrap();
+        cfg.dns.upstreams = vec![upstream];
+        cfg.dns.max_udp_in_flight = 4;
+        cfg.dns.upstream_timeout_ms = 30_000;
+        cfg.dns.request_timeout_ms = 30_000;
+        cfg.dns.cache = false;
+
+        let resolver = Arc::new(test_resolver(&cfg));
+        let sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let server_addr = sock.local_addr().unwrap();
+
+        // A trimmed copy of the serve_udp accept loop: same permit discipline.
+        let in_flight = Arc::new(tokio::sync::Semaphore::new(resolver.max_udp_in_flight()));
+        let spawned = Arc::new(AtomicU64::new(0));
+        {
+            let (sock, resolver, in_flight, spawned) = (
+                Arc::clone(&sock),
+                Arc::clone(&resolver),
+                Arc::clone(&in_flight),
+                Arc::clone(&spawned),
+            );
+            tokio::spawn(async move {
+                let mut buf = vec![0u8; 4096];
+                loop {
+                    let Ok((len, peer)) = sock.recv_from(&mut buf).await else {
+                        continue;
+                    };
+                    let Ok(permit) = Arc::clone(&in_flight).try_acquire_owned() else {
+                        resolver.note_udp_overload();
+                        continue;
+                    };
+                    let request = buf[..len].to_vec();
+                    let resolver = Arc::clone(&resolver);
+                    spawned.fetch_add(1, Ordering::Relaxed);
+                    tokio::spawn(async move {
+                        let _permit = permit;
+                        let _ = resolver.handle(&request, peer).await;
+                    });
+                }
+            });
+        }
+
+        let client = TokioUdp::bind("127.0.0.1:0").await.unwrap();
+        for i in 0..60u16 {
+            let req = request_msg("stall.example.com.", RecordType::A, i);
+            client
+                .send_to(&req.to_vec().unwrap(), server_addr)
+                .await
+                .unwrap();
+            // Let the server loop run between sends.
+            tokio::task::yield_now().await;
+        }
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        let started = spawned.load(Ordering::Relaxed);
+        let dropped = resolver.stats.udp_overload_drops.load(Ordering::Relaxed);
+        assert!(
+            started <= cfg.dns.max_udp_in_flight as u64,
+            "never more concurrent work than the limit: {started} started, limit {}",
+            cfg.dns.max_udp_in_flight
+        );
+        assert!(
+            dropped > 0,
+            "the excess must be shed and counted, not silently queued"
+        );
+        assert_eq!(
+            in_flight.available_permits(),
+            0,
+            "all permits are held by the stalled requests"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_permit_is_released_when_the_request_finishes() {
+        let sem = Arc::new(tokio::sync::Semaphore::new(1));
+        {
+            let permit = Arc::clone(&sem).try_acquire_owned().unwrap();
+            let h = tokio::spawn(async move {
+                let _permit = permit;
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            });
+            assert_eq!(sem.available_permits(), 0, "held for the whole request");
+            h.await.unwrap();
+        }
+        assert_eq!(sem.available_permits(), 1, "released on completion");
+    }
+
+    #[tokio::test]
+    async fn a_request_that_outlives_its_budget_gets_servfail() {
+        let blackhole = TokioUdp::bind("127.0.0.1:0").await.unwrap();
+        let upstream = blackhole.local_addr().unwrap();
+        tokio::spawn(async move {
+            let mut buf = vec![0u8; 512];
+            loop {
+                let _ = blackhole.recv_from(&mut buf).await;
+            }
+        });
+
+        let mut cfg = crate::config::Config::default();
+        cfg.dns.upstreams = vec![upstream];
+        // Upstream would wait far longer than the end-to-end budget allows.
+        cfg.dns.upstream_timeout_ms = 30_000;
+        cfg.dns.request_timeout_ms = 150;
+        cfg.dns.cache = false;
+        let resolver = test_resolver(&cfg);
+
+        let req = request_msg("slow.example.com.", RecordType::A, 0x77);
+        let peer: SocketAddr = "127.0.0.1:5300".parse().unwrap();
+        let raw = resolver
+            .handle(&req.to_vec().unwrap(), peer)
+            .await
+            .expect("a timeout must still answer");
+
+        let resp = Message::from_vec(&raw).unwrap();
+        assert_eq!(resp.metadata.response_code, ResponseCode::ServFail);
+        assert_eq!(resp.metadata.id, 0x77, "answer must match the request");
+        assert_eq!(resolver.stats.request_timeouts.load(Ordering::Relaxed), 1);
     }
 
     #[test]

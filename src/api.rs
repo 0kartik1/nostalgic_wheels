@@ -224,6 +224,12 @@ struct Status {
     cache_hits: u64,
     upstream_errors: u64,
     queries_denied: u64,
+    /// Saturation signals: non-zero means the Pi shed work.
+    udp_overload_drops: u64,
+    tcp_rejections: u64,
+    request_timeouts: u64,
+    max_udp_in_flight: usize,
+    max_tcp_connections: usize,
     allow_from: Vec<String>,
     system: crate::netinfo::SystemInfo,
     gateway: Option<String>,
@@ -301,6 +307,19 @@ async fn status(State(state): State<AppState>) -> ApiResult<Json<Status>> {
         cache_hits: state.resolver.stats.cache_hits.load(Ordering::Relaxed),
         upstream_errors: state.resolver.stats.upstream_errors.load(Ordering::Relaxed),
         queries_denied: state.resolver.stats.denied.load(Ordering::Relaxed),
+        udp_overload_drops: state
+            .resolver
+            .stats
+            .udp_overload_drops
+            .load(Ordering::Relaxed),
+        tcp_rejections: state.resolver.stats.tcp_rejections.load(Ordering::Relaxed),
+        request_timeouts: state
+            .resolver
+            .stats
+            .request_timeouts
+            .load(Ordering::Relaxed),
+        max_udp_in_flight: state.cfg.dns.max_udp_in_flight,
+        max_tcp_connections: state.cfg.dns.max_tcp_connections,
         allow_from: state.cfg.dns.allow_from.clone(),
         system: crate::netinfo::system_info(),
         gateway: route.map(|r| format!("{} via {}", r.gateway, r.iface)),

@@ -36,6 +36,14 @@ pub struct DnsConfig {
     /// we must buffer per in-flight query regardless of what a client claims
     /// it can receive. Anything bigger arrives over TCP instead.
     pub upstream_udp_payload: u16,
+    /// Most DNS requests handled at once. Past this, new UDP packets are
+    /// dropped rather than queued: a client that gets no answer retries, but
+    /// a queue that grows without limit takes the whole Pi down.
+    pub max_udp_in_flight: usize,
+    /// Most simultaneous DNS-over-TCP connections. Excess is closed at accept.
+    pub max_tcp_connections: usize,
+    /// Ceiling on one request end to end, across every upstream attempt.
+    pub request_timeout_ms: u64,
     /// Cache answers locally. Big latency win on a home network.
     pub cache: bool,
     /// Maximum cache entries before the oldest-expiring are dropped.
@@ -112,6 +120,15 @@ impl Default for DnsConfig {
             // every real answer, small enough to avoid IP fragmentation on a
             // 1500-byte-MTU home link.
             upstream_udp_payload: 1232,
+            // Sized for a household on a 4 GB Pi: comfortably above real peak
+            // demand, low enough that a misbehaving device cannot exhaust
+            // memory. Each in-flight query holds roughly a socket plus its
+            // buffers.
+            max_udp_in_flight: 128,
+            max_tcp_connections: 64,
+            // Must exceed upstream_timeout_ms * number of upstreams so a
+            // normal failover is not cut short.
+            request_timeout_ms: 10_000,
             cache: true,
             cache_max_entries: 20_000,
             cache_min_ttl: 30,
@@ -198,6 +215,10 @@ impl Config {
         // Fail at startup on a malformed ACL rather than silently falling back
         // to a stance the operator did not choose.
         crate::dns::acl::Acl::parse(&self.dns.allow_from)?;
+        anyhow::ensure!(
+            self.dns.max_udp_in_flight > 0 && self.dns.max_tcp_connections > 0,
+            "dns.max_udp_in_flight and dns.max_tcp_connections must be greater than zero"
+        );
         anyhow::ensure!(
             matches!(self.blocking.mode.as_str(), "zero_ip" | "nxdomain"),
             "blocking.mode must be \"zero_ip\" or \"nxdomain\", got {:?}",
