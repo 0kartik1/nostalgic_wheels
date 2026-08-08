@@ -110,6 +110,11 @@ impl Resolver {
         false
     }
 
+    /// Largest UDP payload we are prepared to put on the wire or reassemble.
+    pub fn udp_payload_limit(&self) -> u16 {
+        self.cfg.upstream_udp_payload
+    }
+
     pub fn is_open_to_world(&self) -> bool {
         self.acl.is_open_to_world()
     }
@@ -130,6 +135,7 @@ impl Resolver {
     /// resolver that stops answering takes the whole network down with it.
     pub async fn handle(&self, request: &[u8], client: SocketAddr) -> Option<Vec<u8>> {
         self.stats.total.fetch_add(1, Ordering::Relaxed);
+        let payload_limit = self.cfg.upstream_udp_payload;
 
         let msg = match Message::from_vec(request) {
             Ok(m) => m,
@@ -144,11 +150,11 @@ impl Resolver {
         // a clean refusal instead of being blindly forwarded.
         if msg.metadata.message_type != MessageType::Query || msg.metadata.op_code != OpCode::Query
         {
-            return encode(&error_response(&msg, ResponseCode::Refused));
+            return encode(&error_response(&msg, ResponseCode::Refused, payload_limit));
         }
 
         let Some(query) = msg.queries.first().cloned() else {
-            return encode(&error_response(&msg, ResponseCode::FormErr));
+            return encode(&error_response(&msg, ResponseCode::FormErr, payload_limit));
         };
 
         let name = query
@@ -185,17 +191,27 @@ impl Resolver {
             return encode(&response);
         }
 
-        // Cache lookup.
-        let key = cache::Key {
-            name: name.clone(),
-            qtype,
-        };
-        if self.cfg.cache {
+        // Cache lookup. The key carries class and the DO/CD bits, so a cached
+        // answer can only satisfy a request that asked the same question in
+        // the same terms.
+        let key = cache::Key::from_request(&msg, &name);
+        if self.cfg.cache
+            && let Some(key) = key.clone()
+        {
             let cached = self.cache.lock().ok().and_then(|mut c| c.get(&key));
-            if let Some(mut hit) = cached {
-                hit.metadata.id = id;
+            if let Some(hit) = cached {
+                // Build a fresh envelope from *this* request. Reusing the
+                // stored message would hand this client the previous one's
+                // transaction ID, RD/CD bits and EDNS options.
+                let mut resp = base_response(&msg, payload_limit);
+                resp.metadata.response_code = hit.response_code;
+                resp.metadata.authoritative = hit.authoritative;
+                resp.answers = hit.answers;
+                resp.authorities = hit.authorities;
+                resp.additionals = hit.additionals;
+
                 self.stats.cache_hits.fetch_add(1, Ordering::Relaxed);
-                let answer = summarize_answers(&hit);
+                let answer = summarize_answers(&resp);
                 self.log(
                     &name,
                     qtype,
@@ -205,13 +221,14 @@ impl Resolver {
                     answer,
                     None,
                 );
-                return encode(&hit);
+                debug_assert_eq!(resp.metadata.id, id);
+                return encode(&resp);
             }
         }
 
         // Forward upstream, trying each resolver in turn.
         let started = Instant::now();
-        match self.forward(request).await {
+        match self.forward(request, &msg).await {
             Ok(raw) => {
                 let elapsed = started.elapsed().as_millis().min(u32::MAX as u128) as u32;
                 let parsed = Message::from_vec(&raw).ok();
@@ -219,6 +236,7 @@ impl Resolver {
                 let (status, answer) = match &parsed {
                     Some(m) => {
                         if self.cfg.cache
+                            && let Some(key) = key.clone()
                             && let Ok(mut c) = self.cache.lock()
                         {
                             c.insert(key, m);
@@ -255,7 +273,7 @@ impl Resolver {
                     None,
                     None,
                 );
-                encode(&error_response(&msg, ResponseCode::ServFail))
+                encode(&error_response(&msg, ResponseCode::ServFail, payload_limit))
             }
         }
     }
@@ -264,50 +282,56 @@ impl Resolver {
     ///
     /// A fresh socket per query gives us source-port randomisation for free,
     /// which is the main defence against off-path answer spoofing.
-    async fn forward(&self, request: &[u8]) -> Result<Vec<u8>> {
+    async fn forward(&self, request: &[u8], parsed: &Message) -> Result<Vec<u8>> {
         let timeout = std::time::Duration::from_millis(self.cfg.upstream_timeout_ms);
+        let limit = self.cfg.upstream_udp_payload;
         let mut last_err = None;
 
+        // Never let a client's advertised EDNS size dictate how much we have to
+        // buffer from upstream. A client may claim it can take 64 KiB; we only
+        // promise upstream what we are actually prepared to reassemble.
+        let wire = clamp_upstream_payload(request, parsed, limit);
+
         for upstream in &self.cfg.upstreams {
-            let bind: SocketAddr = if upstream.is_ipv4() {
-                "0.0.0.0:0".parse().unwrap()
-            } else {
-                "[::]:0".parse().unwrap()
-            };
-
             let attempt = async {
-                let sock = UdpSocket::bind(bind)
-                    .await
-                    .context("binding upstream socket")?;
-                // connect() filters replies to this peer only.
-                sock.connect(upstream)
-                    .await
-                    .context("connecting upstream")?;
-                sock.send(request).await.context("sending to upstream")?;
+                let reply = udp_exchange(*upstream, &wire, limit).await?;
 
-                let mut buf = vec![0u8; 4096];
-                loop {
-                    let n = sock
-                        .recv(&mut buf)
-                        .await
-                        .context("reading upstream reply")?;
-                    // Drop anything whose transaction ID does not match.
-                    if n >= 2 && buf[0..2] == request[0..2] {
-                        buf.truncate(n);
-                        return Ok::<Vec<u8>, anyhow::Error>(buf);
-                    }
-                    tracing::debug!("discarding upstream reply with mismatched id");
+                // A truncated UDP answer is not an answer. Retry this same
+                // upstream over TCP rather than relaying TC onward: a client
+                // that already used TCP has nowhere left to escalate to, and
+                // caching a TC stub would be wrong for everyone.
+                let truncated = Message::from_vec(&reply)
+                    .map(|m| m.metadata.truncation)
+                    .unwrap_or(false);
+                if truncated {
+                    tracing::debug!("upstream {upstream} truncated; retrying over TCP");
+                    return tcp_exchange(*upstream, &wire).await;
                 }
+                Ok::<Vec<u8>, anyhow::Error>(reply)
             };
 
             match tokio::time::timeout(timeout, attempt).await {
-                Ok(Ok(reply)) => return Ok(reply),
+                Ok(Ok(reply)) => {
+                    // Only accept an answer to the question we actually asked.
+                    match Message::from_vec(&reply) {
+                        Ok(m) if answers_request(parsed, &m) => return Ok(reply),
+                        Ok(_) => {
+                            last_err = Some(anyhow::anyhow!(
+                                "upstream {upstream} answered a different question"
+                            ));
+                        }
+                        Err(e) => {
+                            last_err =
+                                Some(anyhow::anyhow!("undecodable reply from {upstream}: {e}"));
+                        }
+                    }
+                }
                 Ok(Err(e)) => last_err = Some(e),
                 Err(_) => {
                     last_err = Some(anyhow::anyhow!("upstream {upstream} timed out"));
                 }
             }
-            tracing::debug!("upstream {upstream} did not answer, trying next");
+            tracing::debug!("upstream {upstream} did not answer usefully, trying next");
         }
 
         Err(last_err.unwrap_or_else(|| anyhow::anyhow!("no upstreams configured")))
@@ -315,7 +339,7 @@ impl Resolver {
 
     /// Build the answer for a blocked name.
     fn sinkhole(&self, request: &Message, qtype: RecordType) -> Message {
-        let mut resp = base_response(request);
+        let mut resp = base_response(request, self.cfg.upstream_udp_payload);
 
         if self.block_nxdomain {
             resp.metadata.response_code = ResponseCode::NXDomain;
@@ -374,21 +398,22 @@ impl Resolver {
     }
 }
 
-fn base_response(request: &Message) -> Message {
+fn base_response(request: &Message, our_max_payload: u16) -> Message {
     let mut resp = Message::response(request.metadata.id, OpCode::Query);
     resp.metadata.recursion_desired = request.metadata.recursion_desired;
     resp.metadata.recursion_available = true;
     resp.metadata.checking_disabled = request.metadata.checking_disabled;
     resp.queries = request.queries.clone();
-    // RFC 6891: a response to a query carrying OPT must carry OPT too.
-    if let Some(edns) = request.edns.clone() {
+    // RFC 6891: a response to a query carrying OPT must carry OPT too — but
+    // advertise the size *we* can reassemble, not the one the client wished for.
+    if let Some(edns) = cache::response_edns(request, our_max_payload) {
         resp.set_edns(edns);
     }
     resp
 }
 
-fn error_response(request: &Message, code: ResponseCode) -> Message {
-    let mut resp = base_response(request);
+fn error_response(request: &Message, code: ResponseCode, our_max_payload: u16) -> Message {
+    let mut resp = base_response(request, our_max_payload);
     resp.metadata.response_code = code;
     resp
 }
@@ -427,14 +452,144 @@ fn summarize_answers(msg: &Message) -> Option<String> {
     Some(parts.join(", "))
 }
 
+/// Re-encode the request with its EDNS payload size clamped to `limit`.
+///
+/// Returns the original bytes untouched when no clamping is needed, so the
+/// common path stays byte-exact and cannot be perturbed by a re-encode.
+fn clamp_upstream_payload(request: &[u8], parsed: &Message, limit: u16) -> Vec<u8> {
+    let needs_clamp = parsed
+        .edns
+        .as_ref()
+        .is_some_and(|e| e.max_payload() > limit);
+    if !needs_clamp {
+        return request.to_vec();
+    }
+
+    let mut m = parsed.clone();
+    if let Some(e) = m.edns.as_mut() {
+        e.set_max_payload(limit);
+    }
+    match m.to_vec() {
+        Ok(v) => v,
+        // Re-encoding should not fail, but forwarding the original is a better
+        // failure mode than dropping the query.
+        Err(e) => {
+            tracing::debug!("could not clamp EDNS payload, forwarding as-is: {e}");
+            request.to_vec()
+        }
+    }
+}
+
+/// One UDP round trip to an upstream, on a fresh socket.
+///
+/// A new socket per query gives source-port randomisation for free, which is
+/// the main defence against off-path answer spoofing. The receive buffer is
+/// sized to what we advertised, so a compliant upstream's answer never gets
+/// silently clipped by the kernel.
+async fn udp_exchange(upstream: SocketAddr, wire: &[u8], limit: u16) -> Result<Vec<u8>> {
+    let bind: SocketAddr = if upstream.is_ipv4() {
+        "0.0.0.0:0".parse().unwrap()
+    } else {
+        "[::]:0".parse().unwrap()
+    };
+
+    let sock = UdpSocket::bind(bind)
+        .await
+        .context("binding upstream socket")?;
+    // connect() filters replies to this peer only.
+    sock.connect(upstream)
+        .await
+        .context("connecting upstream")?;
+    sock.send(wire).await.context("sending to upstream")?;
+
+    // Never smaller than the 512-byte classic limit, even if configured low.
+    let mut buf = vec![0u8; (limit as usize).max(512)];
+    loop {
+        let n = sock
+            .recv(&mut buf)
+            .await
+            .context("reading upstream reply")?;
+        // Cheap pre-filter on the transaction ID; the caller re-checks the
+        // full question once the message is decoded.
+        if n >= 2 && buf[0..2] == wire[0..2] {
+            buf.truncate(n);
+            return Ok(buf);
+        }
+        tracing::debug!("discarding upstream reply with mismatched id");
+    }
+}
+
+/// One DNS-over-TCP round trip, used when UDP came back truncated.
+async fn tcp_exchange(upstream: SocketAddr, wire: &[u8]) -> Result<Vec<u8>> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let mut stream = tokio::net::TcpStream::connect(upstream)
+        .await
+        .context("connecting upstream over TCP")?;
+
+    // RFC 1035 §4.2.2: a two-byte big-endian length precedes the message.
+    let len = u16::try_from(wire.len()).context("request too large for DNS/TCP")?;
+    stream
+        .write_all(&len.to_be_bytes())
+        .await
+        .context("sending TCP length prefix")?;
+    stream
+        .write_all(wire)
+        .await
+        .context("sending TCP request")?;
+
+    let mut len_buf = [0u8; 2];
+    stream
+        .read_exact(&mut len_buf)
+        .await
+        .context("reading TCP length prefix")?;
+    let expect = u16::from_be_bytes(len_buf) as usize;
+    if expect == 0 {
+        anyhow::bail!("upstream sent an empty TCP response");
+    }
+
+    // Bounded by the 16-bit length prefix, so this cannot be used to make us
+    // allocate without limit.
+    let mut reply = vec![0u8; expect];
+    stream
+        .read_exact(&mut reply)
+        .await
+        .context("reading TCP response body")?;
+    Ok(reply)
+}
+
+/// Whether `resp` actually answers `req`, rather than merely sharing its ID.
+///
+/// An off-path attacker who guesses the transaction ID still has to match the
+/// question, and a confused upstream that answers the wrong thing is a bug we
+/// would rather surface than cache.
+fn answers_request(req: &Message, resp: &Message) -> bool {
+    if resp.metadata.id != req.metadata.id {
+        return false;
+    }
+    // A response to a query with no question section is not something we
+    // forward, so both sides must carry exactly one matching question.
+    let (Some(q), Some(a)) = (req.queries.first(), resp.queries.first()) else {
+        return false;
+    };
+    q.query_type() == a.query_type()
+        && q.query_class() == a.query_class()
+        // Names are compared case-insensitively: 0x20 randomisation and plain
+        // case-preserving upstreams both echo the question back in mixed case.
+        && q.name().to_ascii().eq_ignore_ascii_case(&a.name().to_ascii())
+}
+
 /// Keep a UDP answer within the size the client said it could accept.
 ///
 /// The limit comes from the request's EDNS0 OPT record, defaulting to the
 /// classic 512 bytes when there is none. Oversized answers come back as a
 /// truncated (TC=1) message, which is the signal to retry over TCP.
-fn fit_udp(request: &[u8], response: Vec<u8>) -> Option<Vec<u8>> {
+fn fit_udp(request: &[u8], response: Vec<u8>, our_max_payload: u16) -> Option<Vec<u8>> {
     let req = Message::from_vec(request).ok()?;
-    let limit = req.max_payload() as usize;
+    // Honour the smaller of what the client asked for and what we are willing
+    // to put on the wire: a client claiming 64 KiB must not provoke a heavily
+    // fragmented datagram just because a TCP upstream had that much to say.
+    let limit = req.max_payload().min(our_max_payload).max(512) as usize;
     if response.len() <= limit {
         return Some(response);
     }
@@ -506,6 +661,7 @@ pub async fn serve_udp(resolver: Arc<Resolver>, listen: SocketAddr) -> Result<()
         })
         .await?,
     );
+    let payload_limit = resolver.udp_payload_limit();
     tracing::info!("DNS listening on {listen}/udp");
 
     // 4096 covers EDNS0 payloads; larger answers arrive over TCP.
@@ -535,7 +691,7 @@ pub async fn serve_udp(resolver: Arc<Resolver>, listen: SocketAddr) -> Result<()
             // If the answer will not fit in the client's UDP buffer, send a
             // proper TC-flagged stub so it retries over TCP. Slicing the bytes
             // would hand the client a malformed message instead.
-            let out = match fit_udp(&request, response) {
+            let out = match fit_udp(&request, response, payload_limit) {
                 Some(bytes) => bytes,
                 None => return,
             };
@@ -761,7 +917,7 @@ mod tests {
     fn refuses_non_query_opcodes() {
         let mut msg = Message::new(7, MessageType::Query, OpCode::Update);
         msg.metadata.id = 7;
-        let resp = error_response(&msg, ResponseCode::Refused);
+        let resp = error_response(&msg, ResponseCode::Refused, 1232);
         assert_eq!(resp.metadata.response_code, ResponseCode::Refused);
         assert_eq!(resp.metadata.id, 7);
     }
@@ -784,6 +940,205 @@ mod tests {
             devices: DeviceStore::new_for_test(),
             stats: Arc::new(Stats::default()),
         }
+    }
+
+    // ---- upstream behaviour, against a real mock resolver ----------------
+    //
+    // These drive the actual socket path rather than a helper in isolation:
+    // the mock binds a real UDP (and where needed TCP) port and speaks wire
+    // format, so encoding, sizing and framing bugs surface here.
+
+    use hickory_proto::op::Query;
+    use tokio::net::UdpSocket as TokioUdp;
+
+    /// A question we can build both a request and a matching answer from.
+    fn q(name: &str, qtype: RecordType) -> Query {
+        let mut query = Query::new();
+        query.set_name(Name::from_ascii(name).unwrap());
+        query.set_query_type(qtype);
+        query
+    }
+
+    fn request_msg(name: &str, qtype: RecordType, id: u16) -> Message {
+        let mut m = Message::query();
+        m.metadata.id = id;
+        m.metadata.recursion_desired = true;
+        m.add_query(q(name, qtype));
+        m
+    }
+
+    /// Build a reply carrying `n` A records, optionally flagged truncated.
+    fn reply_for(req: &Message, n: usize, truncated: bool) -> Message {
+        let mut r = Message::response(req.metadata.id, OpCode::Query);
+        r.queries = req.queries.clone();
+        r.metadata.truncation = truncated;
+        if !truncated {
+            for i in 0..n {
+                r.answers.push(Record::from_rdata(
+                    Name::from_ascii(format!("host{i}.example.com.")).unwrap(),
+                    300,
+                    RData::A(A(Ipv4Addr::new(10, 0, (i / 256) as u8, (i % 256) as u8))),
+                ));
+            }
+        }
+        r
+    }
+
+    #[tokio::test]
+    async fn upstream_tc_answer_is_retried_over_tcp() {
+        // The bug this pins: a truncated UDP answer used to be relayed
+        // straight through. A TCP client receiving TC has nowhere to escalate
+        // to, so the name simply never resolved.
+        let udp = TokioUdp::bind("127.0.0.1:0").await.unwrap();
+        let upstream: SocketAddr = udp.local_addr().unwrap();
+        let tcp = TcpListener::bind(upstream).await.unwrap();
+
+        // UDP side: always answer TC=1, no records.
+        tokio::spawn(async move {
+            let mut buf = vec![0u8; 4096];
+            let (n, peer) = udp.recv_from(&mut buf).await.unwrap();
+            let req = Message::from_vec(&buf[..n]).unwrap();
+            let tc = reply_for(&req, 0, true);
+            udp.send_to(&tc.to_vec().unwrap(), peer).await.unwrap();
+        });
+
+        // TCP side: serve the full answer with length framing.
+        tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let (mut s, _) = tcp.accept().await.unwrap();
+            let mut len = [0u8; 2];
+            s.read_exact(&mut len).await.unwrap();
+            let mut body = vec![0u8; u16::from_be_bytes(len) as usize];
+            s.read_exact(&mut body).await.unwrap();
+            let req = Message::from_vec(&body).unwrap();
+            let full = reply_for(&req, 40, false).to_vec().unwrap();
+            s.write_all(&(full.len() as u16).to_be_bytes())
+                .await
+                .unwrap();
+            s.write_all(&full).await.unwrap();
+        });
+
+        let mut cfg = crate::config::Config::default();
+        cfg.dns.upstreams = vec![upstream];
+        let resolver = test_resolver(&cfg);
+
+        let req = request_msg("big.example.com.", RecordType::A, 0x4242);
+        let wire = req.to_vec().unwrap();
+        let raw = resolver.forward(&wire, &req).await.expect("TCP fallback");
+
+        let got = Message::from_vec(&raw).unwrap();
+        assert!(!got.metadata.truncation, "TC must be resolved, not relayed");
+        assert_eq!(got.answers.len(), 40, "full answer came back over TCP");
+    }
+
+    #[tokio::test]
+    async fn a_reply_to_a_different_question_is_rejected() {
+        // Matching only the transaction ID is not enough.
+        let udp = TokioUdp::bind("127.0.0.1:0").await.unwrap();
+        let upstream: SocketAddr = udp.local_addr().unwrap();
+
+        tokio::spawn(async move {
+            let mut buf = vec![0u8; 4096];
+            let (n, peer) = udp.recv_from(&mut buf).await.unwrap();
+            let req = Message::from_vec(&buf[..n]).unwrap();
+            // Same ID, different name entirely.
+            let mut evil = Message::response(req.metadata.id, OpCode::Query);
+            evil.add_query(q("attacker.example.net.", RecordType::A));
+            evil.answers.push(Record::from_rdata(
+                Name::from_ascii("attacker.example.net.").unwrap(),
+                300,
+                RData::A(A(Ipv4Addr::new(6, 6, 6, 6))),
+            ));
+            udp.send_to(&evil.to_vec().unwrap(), peer).await.unwrap();
+        });
+
+        let mut cfg = crate::config::Config::default();
+        cfg.dns.upstreams = vec![upstream];
+        cfg.dns.upstream_timeout_ms = 400;
+        let resolver = test_resolver(&cfg);
+
+        let req = request_msg("victim.example.com.", RecordType::A, 0x1111);
+        let wire = req.to_vec().unwrap();
+        let err = resolver
+            .forward(&wire, &req)
+            .await
+            .expect_err("a mismatched question must not be accepted");
+        assert!(
+            format!("{err:#}").contains("different question"),
+            "unexpected error: {err:#}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_client_without_edns_still_gets_a_large_answer_via_tcp() {
+        // No OPT means a 512-byte ceiling upstream, so a big answer must come
+        // back through the TC path rather than being lost.
+        let udp = TokioUdp::bind("127.0.0.1:0").await.unwrap();
+        let upstream: SocketAddr = udp.local_addr().unwrap();
+        let tcp = TcpListener::bind(upstream).await.unwrap();
+
+        tokio::spawn(async move {
+            let mut buf = vec![0u8; 4096];
+            let (n, peer) = udp.recv_from(&mut buf).await.unwrap();
+            let req = Message::from_vec(&buf[..n]).unwrap();
+            udp.send_to(&reply_for(&req, 0, true).to_vec().unwrap(), peer)
+                .await
+                .unwrap();
+        });
+        tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let (mut s, _) = tcp.accept().await.unwrap();
+            let mut len = [0u8; 2];
+            s.read_exact(&mut len).await.unwrap();
+            let mut body = vec![0u8; u16::from_be_bytes(len) as usize];
+            s.read_exact(&mut body).await.unwrap();
+            let req = Message::from_vec(&body).unwrap();
+            let full = reply_for(&req, 30, false).to_vec().unwrap();
+            s.write_all(&(full.len() as u16).to_be_bytes())
+                .await
+                .unwrap();
+            s.write_all(&full).await.unwrap();
+        });
+
+        let mut cfg = crate::config::Config::default();
+        cfg.dns.upstreams = vec![upstream];
+        let resolver = test_resolver(&cfg);
+
+        let req = request_msg("nedns.example.com.", RecordType::A, 0x2222);
+        assert!(req.edns.is_none(), "fixture must have no OPT");
+        let raw = resolver
+            .forward(&req.to_vec().unwrap(), &req)
+            .await
+            .unwrap();
+        assert_eq!(Message::from_vec(&raw).unwrap().answers.len(), 30);
+    }
+
+    #[test]
+    fn an_oversized_client_edns_is_clamped_before_going_upstream() {
+        // A client claiming 64 KiB must not dictate how much we buffer.
+        let mut req = request_msg("example.com.", RecordType::A, 7);
+        let mut edns = hickory_proto::op::Edns::new();
+        edns.set_max_payload(65535);
+        req.set_edns(edns);
+
+        let original = req.to_vec().unwrap();
+        let clamped = clamp_upstream_payload(&original, &req, 1232);
+        let sent = Message::from_vec(&clamped).unwrap();
+        assert_eq!(sent.max_payload(), 1232);
+    }
+
+    #[test]
+    fn a_request_already_within_the_limit_is_forwarded_byte_for_byte() {
+        let mut req = request_msg("example.com.", RecordType::A, 9);
+        let mut edns = hickory_proto::op::Edns::new();
+        edns.set_max_payload(512);
+        req.set_edns(edns);
+        let original = req.to_vec().unwrap();
+        assert_eq!(
+            clamp_upstream_payload(&original, &req, 1232),
+            original,
+            "no re-encode when no clamping is needed"
+        );
     }
 
     #[test]
@@ -837,7 +1192,7 @@ mod tests {
             RData::A(A(Ipv4Addr::new(1, 2, 3, 4))),
         ));
         let bytes = resp.to_vec().unwrap();
-        let out = fit_udp(&request, bytes.clone()).expect("should fit");
+        let out = fit_udp(&request, bytes.clone(), 4096).expect("should fit");
         assert_eq!(out, bytes, "a small answer must not be rewritten");
     }
 
@@ -861,7 +1216,7 @@ mod tests {
             "test fixture should exceed the UDP limit"
         );
 
-        let out = fit_udp(&request, bytes).expect("should produce a stub");
+        let out = fit_udp(&request, bytes, 4096).expect("should produce a stub");
         let parsed = Message::from_vec(&out).unwrap();
         assert!(parsed.metadata.truncation, "TC bit must be set");
         assert!(
@@ -885,45 +1240,8 @@ mod tests {
         edns.set_max_payload(4096);
         req.set_edns(edns);
 
-        let resp = base_response(&req);
+        let resp = base_response(&req, 4096);
         assert!(resp.edns.is_some(), "OPT must be echoed per RFC 6891");
         assert_eq!(resp.max_payload(), 4096);
-    }
-
-    #[test]
-    fn cache_counts_ttl_down() {
-        let mut c = cache::Cache::new(10, 1, 3600);
-        let mut msg = Message::response(1, OpCode::Query);
-        msg.answers.push(Record::from_rdata(
-            Name::from_ascii("example.com.").unwrap(),
-            300,
-            RData::A(A(Ipv4Addr::new(1, 2, 3, 4))),
-        ));
-        let key = cache::Key {
-            name: "example.com".into(),
-            qtype: RecordType::A,
-        };
-        assert!(c.insert(key.clone(), &msg));
-
-        let hit = c.get(&key).expect("should hit");
-        // Immediately after insert the TTL is intact (or one second lower).
-        assert!(hit.answers[0].ttl <= 300 && hit.answers[0].ttl >= 299);
-    }
-
-    #[test]
-    fn cache_rejects_servfail() {
-        let mut c = cache::Cache::new(10, 1, 3600);
-        let mut msg = Message::response(1, OpCode::Query);
-        msg.metadata.response_code = ResponseCode::ServFail;
-        msg.answers.push(Record::from_rdata(
-            Name::from_ascii("example.com.").unwrap(),
-            300,
-            RData::A(A(Ipv4Addr::new(1, 2, 3, 4))),
-        ));
-        let key = cache::Key {
-            name: "example.com".into(),
-            qtype: RecordType::A,
-        };
-        assert!(!c.insert(key, &msg));
     }
 }

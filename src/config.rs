@@ -32,6 +32,10 @@ pub struct DnsConfig {
     pub upstreams: Vec<SocketAddr>,
     /// How long to wait for an upstream before trying the next one.
     pub upstream_timeout_ms: u64,
+    /// Largest UDP answer we will ask an upstream for, in bytes. Caps how much
+    /// we must buffer per in-flight query regardless of what a client claims
+    /// it can receive. Anything bigger arrives over TCP instead.
+    pub upstream_udp_payload: u16,
     /// Cache answers locally. Big latency win on a home network.
     pub cache: bool,
     /// Maximum cache entries before the oldest-expiring are dropped.
@@ -104,6 +108,10 @@ impl Default for DnsConfig {
             allow_from: vec!["loopback".to_string(), "private".to_string()],
             upstreams: vec!["1.1.1.1:53".parse().unwrap(), "9.9.9.9:53".parse().unwrap()],
             upstream_timeout_ms: 2500,
+            // The DNS Flag Day 2020 recommendation: large enough for almost
+            // every real answer, small enough to avoid IP fragmentation on a
+            // 1500-byte-MTU home link.
+            upstream_udp_payload: 1232,
             cache: true,
             cache_max_entries: 20_000,
             cache_min_ttl: 30,
