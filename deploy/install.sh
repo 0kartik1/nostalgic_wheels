@@ -53,13 +53,22 @@ info "installing $BIN_DEST"
 install -m 0755 "$BIN_SRC" "$BIN_DEST"
 
 # --- config -----------------------------------------------------------------
-install -d -m 0755 "$CONF_DIR"
+install -d -m 0750 -o root -g "$SVC_USER" "$CONF_DIR"
 if [[ -f $CONF ]]; then
   info "keeping existing $CONF"
   install -m 0644 config.example.toml "$CONF_DIR/config.example.toml"
 else
   info "installing default $CONF"
-  install -m 0644 config.example.toml "$CONF"
+  # The config may hold web.admin_token, so it is readable by the service
+  # account and root, and by nobody else.
+  install -m 0640 -o root -g "$SVC_USER" config.example.toml "$CONF"
+fi
+
+# Tighten an existing config too: earlier versions installed it world-readable
+# and it can now contain a secret.
+if [[ -f $CONF ]]; then
+  chown root:"$SVC_USER" "$CONF"
+  chmod 0640 "$CONF"
 fi
 
 # --- state ------------------------------------------------------------------
@@ -95,9 +104,23 @@ cat <<EOF
 
 $(info "netwatch is running")
 
-  Dashboard   http://$IP:8080
+  Dashboard   http://localhost:8080  (on the Pi; see below for remote access)
   Logs        journalctl -u netwatch -f
   Config      $CONF   (systemctl restart netwatch after editing)
+
+The dashboard listens on loopback only by default, because it can change block
+rules and flush the DNS cache. To reach it from another machine, either:
+
+  Tunnel over SSH (nothing to configure, nothing exposed)
+      ssh -L 8080:localhost:8080 $(whoami)@$IP
+      then browse to http://localhost:8080
+
+  Or bind it to the LAN, which requires a token:
+      TOKEN=\$(openssl rand -hex 32)
+      sudo sed -i "s|^listen = \"127.0.0.1:8080\"|listen = \"0.0.0.0:8080\"|" $CONF
+      echo "admin_token = \"\$TOKEN\"" | sudo tee -a $CONF   # under [web]
+      sudo systemctl restart netwatch
+      # netwatch refuses to start if it is off-loopback without a token.
 
 Nothing is being monitored yet — devices have to be told to use the Pi for DNS.
 Pick one:

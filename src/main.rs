@@ -105,6 +105,8 @@ async fn main() -> Result<()> {
     tracing::info!("database at {}", cfg.storage.database.display());
 
     // ---- blocklists --------------------------------------------------------
+    let list_health = blocklist::new_health(&cfg);
+    let refresh_lock = blocklist::new_refresh_lock();
     if cfg.blocking.enabled && !cli.no_fetch {
         // Only download if we have nothing cached; otherwise start fast and let
         // the refresh task update in the background.
@@ -115,8 +117,13 @@ async fn main() -> Result<()> {
             .all(|u| cfg.cached_list_path(u).exists());
         if !have_cache {
             tracing::info!("downloading blocklists (first run)");
-            if let Err(e) = blocklist::refresh_sources(&cfg).await {
-                tracing::error!("blocklist download failed, continuing without: {e:#}");
+            let outcome = blocklist::refresh_sources(&cfg, &list_health).await;
+            if outcome.total_failure() {
+                tracing::error!(
+                    "all {} blocklist sources failed; starting without filtering. \
+                     Check connectivity and POST /api/reload to retry.",
+                    outcome.attempted
+                );
             }
         }
     }
@@ -172,9 +179,14 @@ async fn main() -> Result<()> {
     // ---- background workers ------------------------------------------------
     let mut tasks: Vec<tokio::task::JoinHandle<()>> = Vec::new();
 
-    {
+    // The IPv4 listener plus, if configured, an independent IPv6 one. They are
+    // separate sockets rather than one dual-stack socket; see `dns::new_socket`.
+    let dns_listeners: Vec<SocketAddr> = std::iter::once(cfg.dns.listen)
+        .chain(cfg.dns.listen_v6)
+        .collect();
+
+    for listen in dns_listeners.iter().copied() {
         let r = Arc::clone(&resolver);
-        let listen = cfg.dns.listen;
         tasks.push(tokio::spawn(async move {
             if let Err(e) = dns::serve_udp(r, listen).await {
                 // DNS is the entire point of this program. `serve_udp` already
@@ -189,9 +201,11 @@ async fn main() -> Result<()> {
         }));
     }
 
-    if cfg.dns.enable_tcp {
+    for listen in dns_listeners.iter().copied() {
+        if !cfg.dns.enable_tcp {
+            break;
+        }
         let r = Arc::clone(&resolver);
-        let listen = cfg.dns.listen;
         tasks.push(tokio::spawn(async move {
             if let Err(e) = dns::serve_tcp(r, listen).await {
                 tracing::error!("DNS/TCP server failed, exiting so systemd restarts us: {e:#}");
@@ -211,21 +225,47 @@ async fn main() -> Result<()> {
         )));
     }
 
+    let discovery_status: devices::SharedDiscoveryStatus = Default::default();
+
     if cfg.discovery.mdns {
         let store = device_store.clone();
+        let st = Arc::clone(&discovery_status);
         tasks.push(tokio::spawn(async move {
+            if let Ok(mut s) = st.write() {
+                s.mdns = devices::ListenerState::Active;
+            }
             // Not fatal: Avahi may already own port 5353.
             if let Err(e) = devices::mdns_listener(store).await {
                 tracing::warn!("mDNS discovery unavailable: {e:#}");
+                if let Ok(mut s) = st.write() {
+                    s.mdns = devices::ListenerState::Unavailable {
+                        reason: format!("{e:#}"),
+                    };
+                }
             }
         }));
     }
 
     if cfg.discovery.dhcp {
+        tracing::warn!(
+            "discovery.dhcp is enabled. netwatch only listens, but a UDP/67 socket \
+             shares a reuseport group with any DHCP server running as the same user, \
+             which would divert leases. Leave it off unless nothing else on this host \
+             serves DHCP."
+        );
         let store = device_store.clone();
+        let st = Arc::clone(&discovery_status);
         tasks.push(tokio::spawn(async move {
+            if let Ok(mut s) = st.write() {
+                s.dhcp = devices::ListenerState::Active;
+            }
             if let Err(e) = devices::dhcp_listener(store).await {
                 tracing::warn!("DHCP discovery unavailable: {e:#}");
+                if let Ok(mut s) = st.write() {
+                    s.dhcp = devices::ListenerState::Unavailable {
+                        reason: format!("{e:#}"),
+                    };
+                }
             }
         }));
     }
@@ -261,21 +301,43 @@ async fn main() -> Result<()> {
         let cfg2 = Arc::clone(&cfg);
         let bl = Arc::clone(&blocklist);
         let r = Arc::clone(&resolver);
+        let health2 = Arc::clone(&list_health);
+        let lock2 = Arc::clone(&refresh_lock);
         let period = Duration::from_secs(cfg.blocking.refresh_hours * 3600);
         tasks.push(tokio::spawn(async move {
             let mut tick = tokio::time::interval(period);
             tick.tick().await; // the first tick fires immediately; skip it
             loop {
                 tick.tick().await;
-                if let Err(e) = blocklist::refresh_sources(&cfg2).await {
-                    tracing::error!("blocklist refresh failed: {e:#}");
+
+                // Skip this cycle if a manual reload holds the lock; it is
+                // doing the same work right now.
+                let Ok(_guard) = lock2.try_lock() else {
+                    tracing::debug!("scheduled refresh skipped, a manual one is running");
+                    continue;
+                };
+
+                let outcome = blocklist::refresh_sources(&cfg2, &health2).await;
+                if outcome.total_failure() {
+                    tracing::error!(
+                        "scheduled refresh: all {} sources failed, keeping cached lists",
+                        outcome.attempted
+                    );
                     continue;
                 }
-                let fresh = blocklist::build(&cfg2);
-                if let Ok(mut guard) = bl.write() {
-                    *guard = fresh;
+
+                // Parsing ~100k domains must not block the executor that is
+                // also serving DNS.
+                let cfg3 = Arc::clone(&cfg2);
+                match tokio::task::spawn_blocking(move || blocklist::build(&cfg3)).await {
+                    Ok(fresh) => {
+                        if let Ok(mut guard) = bl.write() {
+                            *guard = fresh;
+                        }
+                        r.flush_cache();
+                    }
+                    Err(e) => tracing::error!("rebuilding blocklist: {e}"),
                 }
-                r.flush_cache();
             }
         }));
     }
@@ -287,6 +349,10 @@ async fn main() -> Result<()> {
         blocklist: Arc::clone(&blocklist),
         resolver: Arc::clone(&resolver),
         started: std::time::Instant::now(),
+        write_drops: writer.drop_counts(),
+        discovery: Arc::clone(&discovery_status),
+        list_health: Arc::clone(&list_health),
+        refresh_lock: Arc::clone(&refresh_lock),
     };
     {
         let listen = cfg.web.listen;

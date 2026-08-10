@@ -6,7 +6,7 @@ on:
   # per push, and the two events carry different refs so `concurrency` cannot
   # collapse them.
   push:
-    branches: [claude/raspberry-pi-optimization-31wp4b, main, master]
+    branches: [main, master]
   pull_request:
   workflow_dispatch:
 
@@ -23,26 +23,44 @@ env:
 
 jobs:
   test:
-    name: Test and lint
+    name: Test and lint (${{ matrix.rust }})
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # stable catches new lints; 1.88 is the MSRV declared in Cargo.toml and
+        # is what an older Pi image is likely to have. A change that only builds
+        # on stable would break exactly the users this targets.
+        rust: [stable, "1.88"]
     steps:
       - uses: actions/checkout@v4
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: ${{ matrix.rust }}
           components: clippy, rustfmt
 
       - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.rust }}
 
       - name: Formatting
+        if: matrix.rust == 'stable'
         run: cargo fmt --all --check
 
+      # Only stable gates on warnings: a newer lint landing in stable should
+      # not retroactively fail the MSRV job, and vice versa.
       - name: Clippy
+        if: matrix.rust == 'stable'
         run: cargo clippy --all-targets -- -D warnings
 
+      - name: Clippy (MSRV, advisory only)
+        if: matrix.rust != 'stable'
+        run: cargo clippy --all-targets
+
       - name: Tests
-        run: cargo test
+        run: cargo test --all-targets
 
   cross:
     name: Cross-compile for ${{ matrix.name }}
@@ -91,3 +109,18 @@ jobs:
           CARGO_TARGET_ARMV7_UNKNOWN_LINUX_GNUEABIHF_LINKER: arm-linux-gnueabihf-gcc
           CC_aarch64_unknown_linux_gnu: aarch64-linux-gnu-gcc
           CC_armv7_unknown_linux_gnueabihf: arm-linux-gnueabihf-gcc
+
+  audit:
+    name: Dependency advisories
+    runs-on: ubuntu-latest
+    # Advisory feeds change without us pushing anything, so a new advisory
+    # should raise a flag, not retroactively fail an unrelated commit.
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --locked
+      - name: Audit
+        run: cargo audit

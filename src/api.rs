@@ -9,8 +9,9 @@ use crate::config::Config;
 use crate::db::{self, ReadHandle};
 use crate::dns::Resolver;
 use anyhow::Result;
-use axum::extract::{Query, State};
-use axum::http::{StatusCode, header};
+use axum::extract::{DefaultBodyLimit, Query, Request, State};
+use axum::http::{HeaderValue, StatusCode, header};
+use axum::middleware::{self, Next};
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
@@ -27,25 +28,74 @@ pub struct AppState {
     pub blocklist: Arc<RwLock<Blocklist>>,
     pub resolver: Arc<Resolver>,
     pub started: std::time::Instant,
+    pub write_drops: Arc<db::DropCounts>,
+    pub discovery: crate::devices::SharedDiscoveryStatus,
+    pub list_health: blocklist::HealthMap,
+    pub refresh_lock: blocklist::RefreshLock,
 }
 
-/// Wrap an anyhow error as a 500 with a readable body.
-struct ApiError(anyhow::Error);
+/// An API failure, carrying the status the client should see.
+///
+/// Unexpected errors become a bare 500: the detail goes to the log, not to the
+/// response, so internal paths and error chains are never exposed over HTTP.
+struct ApiError {
+    status: StatusCode,
+    /// Safe to show a client. `None` means "log it, tell them nothing".
+    public: Option<String>,
+    internal: Option<anyhow::Error>,
+}
+
+impl ApiError {
+    fn conflict(msg: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::CONFLICT,
+            public: Some(msg.into()),
+            internal: None,
+        }
+    }
+
+    fn bad_gateway(msg: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::BAD_GATEWAY,
+            public: Some(msg.into()),
+            internal: None,
+        }
+    }
+
+    fn unauthorized() -> Self {
+        Self {
+            status: StatusCode::UNAUTHORIZED,
+            public: Some("a valid admin token is required".to_string()),
+            internal: None,
+        }
+    }
+
+    fn bad_request(msg: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::BAD_REQUEST,
+            public: Some(msg.into()),
+            internal: None,
+        }
+    }
+}
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
-        tracing::error!("API error: {:#}", self.0);
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({ "error": self.0.to_string() })),
-        )
-            .into_response()
+        if let Some(e) = &self.internal {
+            tracing::error!("API error: {e:#}");
+        }
+        let body = self.public.unwrap_or_else(|| "internal error".to_string());
+        (self.status, Json(json!({ "error": body }))).into_response()
     }
 }
 
 impl<E: Into<anyhow::Error>> From<E> for ApiError {
     fn from(e: E) -> Self {
-        Self(e.into())
+        Self {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            public: None,
+            internal: Some(e.into()),
+        }
     }
 }
 
@@ -68,8 +118,25 @@ where
     Ok(out)
 }
 
+/// The only bodies this API accepts are `{"domain": "..."}`. Anything larger
+/// is a mistake or an attempt to make us allocate.
+const MAX_BODY_BYTES: usize = 16 * 1024;
+
+/// Ceiling on one HTTP request. The heaviest handler is a blocklist rebuild.
+const HTTP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
 pub fn router(state: AppState) -> Router {
-    Router::new()
+    // Anything that changes resolver behaviour: block rules, cache, lists.
+    let mutating = Router::new()
+        .route("/api/deny", post(add_deny).delete(remove_deny))
+        .route("/api/allow", post(add_allow).delete(remove_allow))
+        .route("/api/reload", post(reload))
+        .route("/api/flush-cache", post(flush_cache))
+        .route_layer(middleware::from_fn_with_state(state.clone(), require_admin));
+
+    // Read-only. Left open so the dashboard renders without a token; none of
+    // it can change what the network resolves.
+    let readonly = Router::new()
         .route("/", get(index))
         .route("/favicon.svg", get(favicon))
         .route("/api/summary", get(summary))
@@ -81,12 +148,90 @@ pub fn router(state: AppState) -> Router {
         .route("/api/timeseries", get(timeseries))
         .route("/api/devices", get(devices))
         .route("/api/interfaces", get(interfaces))
-        .route("/api/status", get(status))
-        .route("/api/deny", post(add_deny).delete(remove_deny))
-        .route("/api/allow", post(add_allow).delete(remove_allow))
-        .route("/api/reload", post(reload))
-        .route("/api/flush-cache", post(flush_cache))
+        .route("/api/status", get(status));
+
+    readonly
+        .merge(mutating)
+        .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
+        .layer(middleware::from_fn(deadline))
+        .layer(middleware::from_fn(security_headers))
         .with_state(state)
+}
+
+/// Reject a state-changing request that does not carry the admin token.
+///
+/// When no token is configured the dashboard is loopback-only (config
+/// validation guarantees it), so local access is the authorisation.
+async fn require_admin(
+    State(state): State<AppState>,
+    request: Request,
+    next: Next,
+) -> Result<Response, ApiError> {
+    let Some(expected) = state.cfg.web.admin_token.as_deref() else {
+        return Ok(next.run(request).await);
+    };
+
+    let presented = request
+        .headers()
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .unwrap_or("");
+
+    if !constant_time_eq(presented.as_bytes(), expected.as_bytes()) {
+        // Deliberately terse: no hint about whether the header was missing,
+        // malformed, or simply wrong.
+        return Err(ApiError::unauthorized());
+    }
+    Ok(next.run(request).await)
+}
+
+/// Compare without leaking length or content through timing.
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+}
+
+/// Cap how long any one request may occupy a connection.
+async fn deadline(request: Request, next: Next) -> Response {
+    match tokio::time::timeout(HTTP_TIMEOUT, next.run(request)).await {
+        Ok(r) => r,
+        Err(_) => (
+            StatusCode::GATEWAY_TIMEOUT,
+            Json(json!({ "error": "request timed out" })),
+        )
+            .into_response(),
+    }
+}
+
+/// The dashboard is entirely self-contained, so it can be locked down hard:
+/// no external loads, no framing, no referrer leakage.
+async fn security_headers(request: Request, next: Next) -> Response {
+    let mut resp = next.run(request).await;
+    let h = resp.headers_mut();
+    // 'unsafe-inline' is required because the page ships its CSS and JS inline
+    // by design (it must work with no network); everything external is still
+    // blocked, which is the risk that matters here.
+    h.insert(
+        header::CONTENT_SECURITY_POLICY,
+        HeaderValue::from_static(
+            "default-src 'self'; script-src 'self' 'unsafe-inline'; \
+             style-src 'self' 'unsafe-inline'; img-src 'self' data:; \
+             connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'",
+        ),
+    );
+    h.insert(
+        header::X_CONTENT_TYPE_OPTIONS,
+        HeaderValue::from_static("nosniff"),
+    );
+    h.insert(
+        header::REFERRER_POLICY,
+        HeaderValue::from_static("no-referrer"),
+    );
+    h.insert("X-Frame-Options", HeaderValue::from_static("DENY"));
+    resp
 }
 
 async fn index() -> impl IntoResponse {
@@ -218,13 +363,30 @@ struct Status {
     blocking_mode: String,
     blocked_domains: usize,
     blocklist_sources: Vec<blocklist::SourceStat>,
+    /// Per-source download health, so a silently stale list is visible.
+    blocklist_health: Vec<blocklist::SourceHealth>,
     cache_entries: usize,
     queries_total: u64,
     queries_blocked: u64,
     cache_hits: u64,
     upstream_errors: u64,
     queries_denied: u64,
+    /// Saturation signals: non-zero means the Pi shed work.
+    udp_overload_drops: u64,
+    tcp_rejections: u64,
+    request_timeouts: u64,
+    /// Events lost to a full write queue, split by kind: a dropped query means
+    /// an incomplete log, a dropped device row only a staler name.
+    dropped_query_events: u64,
+    dropped_device_events: u64,
+    dropped_monitoring_events: u64,
+    max_udp_in_flight: usize,
+    max_tcp_connections: usize,
     allow_from: Vec<String>,
+    /// Database and sidecar file sizes, plus whether space can be reclaimed.
+    storage: db::StorageSizes,
+    /// Whether each passive discovery listener is off, running, or broken.
+    discovery: crate::devices::DiscoveryStatus,
     system: crate::netinfo::SystemInfo,
     gateway: Option<String>,
     lan_subnet: Option<String>,
@@ -254,6 +416,8 @@ struct LatencyStatus {
 
 async fn status(State(state): State<AppState>) -> ApiResult<Json<Status>> {
     let latency = with_db(&state, db::latest_latency).await?;
+    let db_path = state.cfg.storage.database.clone();
+    let storage = with_db(&state, move |c| Ok(db::storage_sizes(c, &db_path))).await?;
     let route = crate::netinfo::default_route();
     let lan = route
         .as_ref()
@@ -295,13 +459,40 @@ async fn status(State(state): State<AppState>) -> ApiResult<Json<Status>> {
         blocking_mode: state.cfg.blocking.mode.clone(),
         blocked_domains,
         blocklist_sources: sources,
+        blocklist_health: state
+            .list_health
+            .read()
+            .map(|h| h.clone())
+            .unwrap_or_default(),
         cache_entries: state.resolver.cache_len(),
         queries_total: state.resolver.stats.total.load(Ordering::Relaxed),
         queries_blocked: state.resolver.stats.blocked.load(Ordering::Relaxed),
         cache_hits: state.resolver.stats.cache_hits.load(Ordering::Relaxed),
         upstream_errors: state.resolver.stats.upstream_errors.load(Ordering::Relaxed),
         queries_denied: state.resolver.stats.denied.load(Ordering::Relaxed),
+        udp_overload_drops: state
+            .resolver
+            .stats
+            .udp_overload_drops
+            .load(Ordering::Relaxed),
+        tcp_rejections: state.resolver.stats.tcp_rejections.load(Ordering::Relaxed),
+        request_timeouts: state
+            .resolver
+            .stats
+            .request_timeouts
+            .load(Ordering::Relaxed),
+        dropped_query_events: state.write_drops.queries.load(Ordering::Relaxed),
+        dropped_device_events: state.write_drops.devices.load(Ordering::Relaxed),
+        dropped_monitoring_events: state.write_drops.monitoring.load(Ordering::Relaxed),
+        max_udp_in_flight: state.cfg.dns.max_udp_in_flight,
+        max_tcp_connections: state.cfg.dns.max_tcp_connections,
         allow_from: state.cfg.dns.allow_from.clone(),
+        storage,
+        discovery: state
+            .discovery
+            .read()
+            .map(|d| d.clone())
+            .unwrap_or_default(),
         system: crate::netinfo::system_info(),
         gateway: route.map(|r| format!("{} via {}", r.gateway, r.iface)),
         lan_subnet: lan.map(|s| s.to_string()),
@@ -319,23 +510,36 @@ struct DomainBody {
 }
 
 /// Rebuild the matcher from disk. Called after any list edit.
-fn rebuild(state: &AppState) -> usize {
-    let fresh = blocklist::build(&state.cfg);
+/// Rebuild the matcher from disk.
+///
+/// Parsing ~100k domains takes long enough that doing it inline would stall
+/// the executor that is also answering DNS for the whole house — clicking
+/// "Block" must not pause everyone's browsing.
+async fn rebuild(state: &AppState) -> ApiResult<usize> {
+    let cfg = Arc::clone(&state.cfg);
+    let fresh = tokio::task::spawn_blocking(move || blocklist::build(&cfg)).await?;
     let len = fresh.len();
     if let Ok(mut bl) = state.blocklist.write() {
         *bl = fresh;
     }
     // A newly blocked domain may be sitting in the cache with a real answer.
     state.resolver.flush_cache();
-    len
+    Ok(len)
 }
 
 async fn add_deny(
     State(state): State<AppState>,
     Json(body): Json<DomainBody>,
 ) -> ApiResult<Json<serde_json::Value>> {
+    // A malformed domain is the caller's mistake, not ours: 400, not 500.
+    if !blocklist::is_valid_domain(&body.domain) {
+        return Err(ApiError::bad_request(format!(
+            "{:?} is not a valid domain",
+            body.domain
+        )));
+    }
     blocklist::append_manual(&state.cfg.manual_deny_path(), &body.domain)?;
-    let n = rebuild(&state);
+    let n = rebuild(&state).await?;
     Ok(Json(json!({ "ok": true, "blocked_domains": n })))
 }
 
@@ -343,8 +547,15 @@ async fn remove_deny(
     State(state): State<AppState>,
     Json(body): Json<DomainBody>,
 ) -> ApiResult<Json<serde_json::Value>> {
+    // A malformed domain is the caller's mistake, not ours: 400, not 500.
+    if !blocklist::is_valid_domain(&body.domain) {
+        return Err(ApiError::bad_request(format!(
+            "{:?} is not a valid domain",
+            body.domain
+        )));
+    }
     blocklist::remove_manual(&state.cfg.manual_deny_path(), &body.domain)?;
-    let n = rebuild(&state);
+    let n = rebuild(&state).await?;
     Ok(Json(json!({ "ok": true, "blocked_domains": n })))
 }
 
@@ -352,8 +563,15 @@ async fn add_allow(
     State(state): State<AppState>,
     Json(body): Json<DomainBody>,
 ) -> ApiResult<Json<serde_json::Value>> {
+    // A malformed domain is the caller's mistake, not ours: 400, not 500.
+    if !blocklist::is_valid_domain(&body.domain) {
+        return Err(ApiError::bad_request(format!(
+            "{:?} is not a valid domain",
+            body.domain
+        )));
+    }
     blocklist::append_manual(&state.cfg.manual_allow_path(), &body.domain)?;
-    let n = rebuild(&state);
+    let n = rebuild(&state).await?;
     Ok(Json(json!({ "ok": true, "blocked_domains": n })))
 }
 
@@ -361,16 +579,56 @@ async fn remove_allow(
     State(state): State<AppState>,
     Json(body): Json<DomainBody>,
 ) -> ApiResult<Json<serde_json::Value>> {
+    // A malformed domain is the caller's mistake, not ours: 400, not 500.
+    if !blocklist::is_valid_domain(&body.domain) {
+        return Err(ApiError::bad_request(format!(
+            "{:?} is not a valid domain",
+            body.domain
+        )));
+    }
     blocklist::remove_manual(&state.cfg.manual_allow_path(), &body.domain)?;
-    let n = rebuild(&state);
+    let n = rebuild(&state).await?;
     Ok(Json(json!({ "ok": true, "blocked_domains": n })))
 }
 
 async fn reload(State(state): State<AppState>) -> ApiResult<Json<serde_json::Value>> {
+    // One refresh at a time: a manual reload racing the scheduled one would
+    // have both writing the same destination files.
+    let Ok(_guard) = state.refresh_lock.try_lock() else {
+        return Err(ApiError::conflict("a blocklist refresh is already running"));
+    };
+
     let cfg = Arc::clone(&state.cfg);
-    blocklist::refresh_sources(&cfg).await?;
-    let n = rebuild(&state);
-    Ok(Json(json!({ "ok": true, "blocked_domains": n })))
+    let outcome = blocklist::refresh_sources(&cfg, &state.list_health).await;
+
+    // Every source failed: say so instead of reporting a cheerful success the
+    // operator would have no reason to doubt. Cached lists are untouched, so
+    // filtering keeps working off whatever we already had.
+    if outcome.total_failure() {
+        let detail = outcome
+            .failures
+            .iter()
+            .map(|(url, why)| format!("{url}: {why}"))
+            .collect::<Vec<_>>()
+            .join("; ");
+        return Err(ApiError::bad_gateway(format!(
+            "all {} blocklist sources failed, keeping the cached copies ({detail})",
+            outcome.attempted
+        )));
+    }
+
+    let n = rebuild(&state).await?;
+    Ok(Json(json!({
+        "ok": true,
+        "blocked_domains": n,
+        "sources_attempted": outcome.attempted,
+        "sources_succeeded": outcome.succeeded,
+        "failures": outcome
+            .failures
+            .iter()
+            .map(|(url, why)| json!({ "source": url, "error": why }))
+            .collect::<Vec<_>>(),
+    })))
 }
 
 async fn flush_cache(State(state): State<AppState>) -> Json<serde_json::Value> {
@@ -383,4 +641,43 @@ pub async fn serve(state: AppState, listen: SocketAddr) -> Result<()> {
     tracing::info!("dashboard listening on http://{listen}");
     axum::serve(listener, router(state)).await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod auth_tests {
+    use super::*;
+
+    #[test]
+    fn token_comparison_is_length_safe_and_correct() {
+        assert!(constant_time_eq(b"abc", b"abc"));
+        assert!(!constant_time_eq(b"abc", b"abd"));
+        assert!(
+            !constant_time_eq(b"abc", b"ab"),
+            "length mismatch is a mismatch"
+        );
+        assert!(!constant_time_eq(b"", b"x"));
+        assert!(constant_time_eq(b"", b""));
+        // A prefix of the real token must not be accepted.
+        assert!(!constant_time_eq(b"secret", b"secret-longer"));
+    }
+
+    #[test]
+    fn an_unauthorized_reply_says_nothing_useful_to_an_attacker() {
+        let err = ApiError::unauthorized();
+        assert_eq!(err.status, StatusCode::UNAUTHORIZED);
+        let msg = err.public.unwrap();
+        // No hint about whether the header was absent, malformed or wrong.
+        assert_eq!(msg, "a valid admin token is required");
+    }
+
+    #[test]
+    fn unexpected_errors_do_not_leak_internal_detail() {
+        let err: ApiError = anyhow::anyhow!("/var/lib/netwatch/secret.db is corrupt").into();
+        assert_eq!(err.status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(
+            err.public.is_none(),
+            "internal paths must go to the log, never the response body"
+        );
+        assert!(err.internal.is_some(), "but must still be logged");
+    }
 }

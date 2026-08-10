@@ -384,6 +384,57 @@ async function api(path, opts) {
   return r.json();
 }
 
+/* ---------------------------------------------------------------------------
+   Admin token.
+
+   Held in sessionStorage only: it is never rendered into the page source and
+   never comes back from the API, so viewing source or reading a response can
+   never reveal it. Cleared when the tab closes.
+   --------------------------------------------------------------------------- */
+const TOKEN_KEY = "netwatch-admin-token";
+
+function getToken() {
+  try { return sessionStorage.getItem(TOKEN_KEY) || ""; } catch (e) { return ""; }
+}
+function setToken(t) {
+  try { t ? sessionStorage.setItem(TOKEN_KEY, t) : sessionStorage.removeItem(TOKEN_KEY); }
+  catch (e) { /* private mode: the token just won't persist */ }
+}
+
+/** A state-changing call. Prompts for the token if the server demands one. */
+async function apiMutate(path, body) {
+  const send = (token) => fetch(path, {
+    method: "POST",
+    headers: Object.assign(
+      { "content-type": "application/json" },
+      token ? { authorization: `Bearer ${token}` } : {}
+    ),
+    body: JSON.stringify(body)
+  });
+
+  let r = await send(getToken());
+  if (r.status === 401) {
+    const entered = window.prompt(
+      "This netwatch dashboard requires an admin token for changes.\n" +
+      "It is the web.admin_token value from /etc/netwatch/config.toml."
+    );
+    if (!entered) throw new Error("a token is required to make changes");
+    setToken(entered.trim());
+    r = await send(getToken());
+    // A second rejection means the token is wrong; don't keep a bad one.
+    if (r.status === 401) {
+      setToken("");
+      throw new Error("that token was rejected");
+    }
+  }
+  if (!r.ok) {
+    let detail = `HTTP ${r.status}`;
+    try { const j = await r.json(); if (j && j.error) detail = j.error; } catch (e) { /* keep status */ }
+    throw new Error(detail);
+  }
+  return r.json();
+}
+
 function live(ok, text) {
   $("live-dot").classList.toggle("bad", !ok);
   $("live-text").textContent = text;
@@ -661,7 +712,9 @@ function renderTiles(s, st) {
     {
       label: "Pi health",
       value: st.system && st.system.cpu_temp_c != null ? st.system.cpu_temp_c.toFixed(1) + "°C" : "—",
-      meta: `load ${st.system ? st.system.load1.toFixed(2) : "—"}${mem != null ? ` · mem ${mem}%` : ""}`
+      meta: (st.system && st.system.throttled)
+        ? `<span style="color:var(--critical)" title="Reported by the Pi firmware. Undervoltage usually means an underpowered supply or a poor cable.">⚠ ${esc(st.system.throttled)}</span>`
+        : `load ${st.system ? st.system.load1.toFixed(2) : "—"}${mem != null ? ` · mem ${mem}%` : ""}`
     },
     { label: "Uptime", value: dur(st.uptime_secs), meta: `netwatch ${esc(st.version)}` }
   ];
@@ -748,11 +801,7 @@ $("log").addEventListener("click", async (ev) => {
 async function rule(kind, domain) {
   const msg = $("rule-msg");
   try {
-    const r = await api("/api/" + (kind === "allow" ? "allow" : "deny"), {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ domain })
-    });
+    const r = await apiMutate("/api/" + (kind === "allow" ? "allow" : "deny"), { domain });
     msg.className = "note";
     msg.textContent = `${kind === "allow" ? "Allowing" : "Blocking"} ${domain}. ${num(r.blocked_domains)} rules active.`;
   } catch (e) {
@@ -792,6 +841,37 @@ function renderStatus(st) {
       ? `<span style="color:var(--warning)">${num(st.upstream_errors)}</span>` : "0"],
     // Surfaced because a wrongly-excluded client is otherwise invisible: it
     // just silently has no DNS.
+    ["Discovery", (() => {
+      const d = st.discovery || {};
+      const fmt = (name, v) => {
+        if (!v || v.state === "disabled") return `${name}: <span style="color:var(--text-muted)">off</span>`;
+        if (v.state === "active") return `${name}: <span style="color:var(--good)">active</span>`;
+        return `${name}: <span style="color:var(--warning)" title="${esc(v.reason || "")}">unavailable</span>`;
+      };
+      return [fmt("mDNS", d.mdns), fmt("DHCP", d.dhcp)].join(" · ");
+    })()],
+    ["Lists", (st.blocklist_health || []).map((h) => {
+      const short = h.url.length > 40 ? "…" + h.url.slice(-40) : h.url;
+      const colour = h.state === "ok" ? "var(--good)"
+        : h.state === "stale" ? "var(--warning)" : "var(--critical)";
+      return `${esc(short)} <span style="color:${colour}" title="${esc(h.error || "")}">${esc(h.state)}</span>`;
+    }).join("<br>") || "—"],
+    ["Shed load", (st.udp_overload_drops || st.tcp_rejections || st.request_timeouts)
+      ? `<span style="color:var(--warning)">${num(st.udp_overload_drops)} udp dropped · ${num(st.tcp_rejections)} tcp refused · ${num(st.request_timeouts)} timed out</span>`
+      : `none (limits ${num(st.max_udp_in_flight)} udp / ${num(st.max_tcp_connections)} tcp)`],
+    ["Storage", (() => {
+      const st2 = st.storage;
+      if (!st2) return "—";
+      const parts = [`${bytes(st2.db_bytes)} db`, `${bytes(st2.wal_bytes)} wal`];
+      if (st2.free_bytes) parts.push(`${bytes(st2.free_bytes)} reclaimable`);
+      if (!st2.incremental_vacuum) {
+        parts.push('<span style="color:var(--text-muted)" title="This database predates incremental vacuum. Deleted rows free space inside the file but do not shrink it. See the README for the one-off rebuild.">fixed size</span>');
+      }
+      return parts.join(" · ");
+    })()],
+    ["Write drops", (st.dropped_query_events || st.dropped_device_events || st.dropped_monitoring_events)
+      ? `<span style="color:var(--warning)">${num(st.dropped_query_events)} queries · ${num(st.dropped_device_events)} devices · ${num(st.dropped_monitoring_events)} monitoring</span>`
+      : "none"],
     ["Answering", (st.allow_from || []).map(esc).join(", ")
       + (st.queries_denied
         ? ` <span style="color:var(--warning)" title="Queries dropped because the source is outside dns.allow_from. If a device on your network has no DNS, add its subnet.">· ${num(st.queries_denied)} dropped from other sources</span>`

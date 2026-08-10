@@ -25,8 +25,17 @@ use hickory_proto::rr::RData;
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::{Arc, RwLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::net::UdpSocket;
+
+/// How often an otherwise-unchanged device gets its `last_seen` refreshed.
+///
+/// This is the whole write-amplification story. Before, a device row was
+/// upserted on *every DNS query* (~100k/day) plus once per ARP poll per
+/// device (~5.7k/day each), all of it rewriting rows that had not changed.
+/// On an SD card that is the difference between a card that lasts and one
+/// that does not.
+const LAST_SEEN_HEARTBEAT: Duration = Duration::from_secs(60);
 
 #[derive(Debug, Clone, Default)]
 struct Device {
@@ -35,6 +44,43 @@ struct Device {
     hostname: Option<String>,
     vendor: Option<String>,
     randomized: bool,
+    /// Fingerprint of the fields as last written, so an identical sighting
+    /// costs nothing.
+    written_fingerprint: Option<u64>,
+    /// When `last_seen` was last pushed to the database.
+    last_seen_written: Option<Instant>,
+}
+
+impl Device {
+    /// Hash of everything worth a write. `last_seen` is deliberately excluded:
+    /// it changes constantly and is handled by the heartbeat instead.
+    fn fingerprint(&self) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        self.ip.hash(&mut h);
+        self.hostname.hash(&mut h);
+        self.vendor.hash(&mut h);
+        self.randomized.hash(&mut h);
+        h.finish()
+    }
+
+    /// Decide whether this sighting is worth a row write, and record that we
+    /// are about to make one. Called under the write lock so two threads
+    /// cannot both conclude "yes" for the same unchanged device.
+    fn take_write_slot(&mut self, now: Instant) -> bool {
+        let fp = self.fingerprint();
+        let changed = self.written_fingerprint != Some(fp);
+        let stale = self
+            .last_seen_written
+            .is_none_or(|t| now.duration_since(t) >= LAST_SEEN_HEARTBEAT);
+
+        if changed || stale {
+            self.written_fingerprint = Some(fp);
+            self.last_seen_written = Some(now);
+            return true;
+        }
+        false
+    }
 }
 
 #[derive(Default)]
@@ -45,6 +91,29 @@ struct Inner {
     /// Names learned for an IP before we knew its MAC.
     pending_names: HashMap<Ipv4Addr, String>,
 }
+
+/// Whether a passive discovery listener is running, off, or broken.
+///
+/// Without this, "no DHCP hostnames" looks identical whether the feature is
+/// disabled, failed to bind, or is simply waiting for a lease renewal.
+#[derive(Debug, Clone, Default, serde::Serialize)]
+pub struct DiscoveryStatus {
+    pub dhcp: ListenerState,
+    pub mdns: ListenerState,
+}
+
+#[derive(Debug, Clone, Default, serde::Serialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum ListenerState {
+    #[default]
+    Disabled,
+    Active,
+    Unavailable {
+        reason: String,
+    },
+}
+
+pub type SharedDiscoveryStatus = Arc<RwLock<DiscoveryStatus>>;
 
 /// Shared, cheaply cloneable device registry.
 #[derive(Clone)]
@@ -117,10 +186,12 @@ impl DeviceStore {
             if let Some(name) = pending {
                 entry.hostname = Some(name);
             }
-            entry.clone()
+            entry.take_write_slot(Instant::now()).then(|| entry.clone())
         };
 
-        self.persist(&dev);
+        if let Some(d) = dev {
+            self.persist(&d);
+        }
     }
 
     /// Record a hostname for a MAC (from DHCP, which carries both).
@@ -151,10 +222,12 @@ impl DeviceStore {
             if entry.vendor.is_none() {
                 entry.vendor = vendor;
             }
-            entry.clone()
+            entry.take_write_slot(Instant::now()).then(|| entry.clone())
         };
 
-        self.persist(&dev);
+        if let Some(d) = dev {
+            self.persist(&d);
+        }
     }
 
     /// Record a hostname discovered for an IP (mDNS, reverse DNS). Stashed
@@ -180,7 +253,7 @@ impl DeviceStore {
                     if entry.hostname.is_none() {
                         entry.hostname = Some(name);
                     }
-                    Some(entry.clone())
+                    entry.take_write_slot(Instant::now()).then(|| entry.clone())
                 }
                 None => {
                     inner.pending_names.insert(ip, name);
@@ -195,14 +268,51 @@ impl DeviceStore {
     }
 
     /// Bump last_seen for whichever device owns this IP.
+    ///
+    /// Called from the DNS hot path, once per query. Almost every call is
+    /// expected to do nothing: the heartbeat means one row write per device
+    /// per minute rather than one per query. A read lock is taken first so the
+    /// overwhelmingly common "nothing to do" case never contends for the write
+    /// lock with the ARP poller or the mDNS listener.
     pub fn touch_ip(&self, ip: IpAddr) {
         let IpAddr::V4(v4) = ip else { return };
-        let dev = {
+        let now = Instant::now();
+
+        {
             let Ok(inner) = self.inner.read() else { return };
-            inner
+            let due = inner
                 .ip_to_mac
                 .get(&v4)
-                .and_then(|m| inner.by_mac.get(m).cloned())
+                .and_then(|m| inner.by_mac.get(m))
+                .is_some_and(|d| {
+                    d.last_seen_written
+                        .is_none_or(|t| now.duration_since(t) >= LAST_SEEN_HEARTBEAT)
+                });
+            if !due {
+                return;
+            }
+        }
+
+        // Due for a heartbeat. Re-check under the write lock, because another
+        // query for the same device may have got here first.
+        let dev = {
+            let Ok(mut inner) = self.inner.write() else {
+                return;
+            };
+            let Some(mac) = inner.ip_to_mac.get(&v4).cloned() else {
+                return;
+            };
+            inner
+                .by_mac
+                .get_mut(&mac)
+                .filter(|d| {
+                    d.last_seen_written
+                        .is_none_or(|t| now.duration_since(t) >= LAST_SEEN_HEARTBEAT)
+                })
+                .map(|d| {
+                    d.last_seen_written = Some(now);
+                    d.clone()
+                })
         };
         if let Some(d) = dev {
             self.persist(&d);
@@ -690,6 +800,160 @@ mod tests {
         assert!(sanitize_hostname("bell\u{7}name").is_none());
         assert!(sanitize_hostname("192.168.1.5").is_none());
         assert!(sanitize_hostname(&"x".repeat(200)).is_none());
+    }
+
+    /// Count how many device rows a store would actually write.
+    fn writes_for(store: &DeviceStore) -> usize {
+        store
+            .inner
+            .read()
+            .unwrap()
+            .by_mac
+            .values()
+            .filter(|d| d.written_fingerprint.is_some())
+            .count()
+    }
+
+    #[test]
+    fn an_unchanged_device_is_not_rewritten() {
+        // The ARP poller re-observes every device every 15s. Before
+        // debouncing, each of those was a row write for data that had not
+        // changed.
+        let mut d = Device {
+            mac: "aa:bb:cc:00:00:01".into(),
+            ip: Some(Ipv4Addr::new(192, 168, 1, 5)),
+            hostname: Some("kitchen-pi".into()),
+            ..Device::default()
+        };
+        let t0 = Instant::now();
+
+        assert!(d.take_write_slot(t0), "first sighting must be written");
+        assert!(!d.take_write_slot(t0), "an identical re-sighting must not");
+        assert!(!d.take_write_slot(t0), "and still must not");
+    }
+
+    #[test]
+    fn a_changed_field_forces_a_write_immediately() {
+        let mut d = Device {
+            mac: "aa:bb:cc:00:00:01".into(),
+            ip: Some(Ipv4Addr::new(192, 168, 1, 5)),
+            ..Device::default()
+        };
+        let t0 = Instant::now();
+        assert!(d.take_write_slot(t0));
+        assert!(!d.take_write_slot(t0));
+
+        // Learning a hostname is exactly the case that must not wait a minute.
+        d.hostname = Some("kitchen-pi".into());
+        assert!(d.take_write_slot(t0), "a real change is written at once");
+
+        d.ip = Some(Ipv4Addr::new(192, 168, 1, 6));
+        assert!(d.take_write_slot(t0), "a new IP is a real change too");
+    }
+
+    #[test]
+    fn last_seen_is_refreshed_on_a_heartbeat_not_per_query() {
+        let mut d = Device {
+            mac: "aa:bb:cc:00:00:01".into(),
+            ip: Some(Ipv4Addr::new(192, 168, 1, 5)),
+            ..Device::default()
+        };
+        let t0 = Instant::now();
+        assert!(d.take_write_slot(t0));
+
+        // Simulate a busy minute of DNS queries: none of them should write.
+        for _ in 0..1000 {
+            assert!(!d.take_write_slot(t0 + Duration::from_secs(30)));
+        }
+        // Once the heartbeat elapses, exactly one write happens.
+        let later = t0 + LAST_SEEN_HEARTBEAT + Duration::from_secs(1);
+        assert!(d.take_write_slot(later), "heartbeat keeps last_seen fresh");
+        assert!(!d.take_write_slot(later), "but only once per interval");
+    }
+
+    #[test]
+    fn repeated_arp_observations_collapse_to_one_write() {
+        let store = DeviceStore::new_for_test();
+        // What the ARP poller does every 15 seconds, forever.
+        for _ in 0..50 {
+            store.observe(Ipv4Addr::new(192, 168, 1, 5), "b8:27:eb:11:22:33");
+        }
+        assert_eq!(
+            writes_for(&store),
+            1,
+            "50 identical ARP sightings are one device, written once"
+        );
+    }
+
+    #[test]
+    fn touch_ip_from_the_query_path_is_debounced() {
+        let store = DeviceStore::new_for_test();
+        store.observe(Ipv4Addr::new(192, 168, 1, 5), "b8:27:eb:11:22:33");
+
+        let before = store
+            .inner
+            .read()
+            .unwrap()
+            .by_mac
+            .values()
+            .next()
+            .unwrap()
+            .last_seen_written;
+
+        // A thousand DNS queries from this device.
+        for _ in 0..1000 {
+            store.touch_ip(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 5)));
+        }
+
+        let after = store
+            .inner
+            .read()
+            .unwrap()
+            .by_mac
+            .values()
+            .next()
+            .unwrap()
+            .last_seen_written;
+        assert_eq!(
+            before, after,
+            "queries inside the heartbeat window must not touch the database"
+        );
+    }
+
+    #[test]
+    fn drop_counts_are_tracked_per_kind() {
+        use crate::db::{QueryEvent, QueryStatus, WriteOp};
+        // A tiny queue that we deliberately overrun.
+        let writer = crate::db::spawn_writer(
+            crate::db::open(std::path::Path::new(":memory:")).unwrap(),
+            Duration::from_secs(3600), // never flush during the test
+            1,
+        );
+        let counts = writer.drop_counts();
+
+        // Enough events to exceed the bounded queue.
+        for i in 0..20_000 {
+            writer.send(WriteOp::Query(QueryEvent {
+                ts: 0,
+                client_ip: "192.168.1.5".into(),
+                domain: format!("d{i}.example.com"),
+                qtype: "A".into(),
+                status: QueryStatus::Forwarded,
+                elapsed_ms: None,
+                answer: None,
+                blocklist: None,
+            }));
+        }
+
+        assert!(
+            counts.queries.load(std::sync::atomic::Ordering::Relaxed) > 0,
+            "overrunning the queue must be counted as dropped queries"
+        );
+        assert_eq!(
+            counts.devices.load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "device drops are counted separately and none were sent"
+        );
     }
 
     #[test]

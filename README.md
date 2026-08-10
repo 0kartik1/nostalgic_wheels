@@ -9,6 +9,10 @@ made it, blocks ad and tracker domains, and serves a live dashboard.
 Single binary, no runtime dependencies. Measured resident memory: **17 MB** with
 a 100,000-domain blocklist loaded, **10 MB** with blocking off.
 
+> **Upgrading from an earlier build?** Two defaults changed for safety. The
+> dashboard now listens on **loopback only**, and DHCP discovery is now **off**.
+> See [Upgrading](#upgrading) — each takes one line of config to restore.
+
 ```
 ┌── Modem ── Router ─┬─ phone, laptop, TV, ...
                      └─ Raspberry Pi ── netwatch ── :53 DNS
@@ -47,6 +51,19 @@ eavesdropping.
 **A domain is not a visit.** Query logs show what a device *resolved*, which
 includes prefetching, background sync, and connection reuse. It is an excellent
 signal, not a browsing history.
+
+**IPv6 clients are logged but not named.** netwatch listens on IPv4 only by
+default; set `dns.listen_v6 = "[::]:53"` to add a second listener. It is a
+second socket rather than a dual-stack one, with `IPV6_V6ONLY` forced on, so it
+cannot accidentally claim the IPv4 port and fight the first listener.
+
+Either way, IPv6 queries are answered and appear in the log by address, but get
+no device attribution: Linux exposes the IPv4 ARP table at `/proc/net/arp` and
+has no equivalent file for IPv6 neighbours — that needs netlink, which is a
+dependency and a chunk of socket code disproportionate to the payoff here. Such
+clients show as bare addresses rather than being silently dropped. If you want
+names, the practical answer today is to hand out only the IPv4 DNS server on
+the LAN, which is what most routers do anyway.
 
 **Devices can bypass you.** A device with a hardcoded DNS server, or using
 DNS-over-HTTPS (most modern browsers, on by default in some), will not appear
@@ -243,8 +260,38 @@ live query log with one-click block/allow per domain. Light and dark themes,
 usable on a phone, and every chart has a table view. No external assets, so it
 works with the Pi offline.
 
-**There is no authentication.** Keep it on your LAN — do not port-forward it. To
-reach it from outside, use a VPN such as WireGuard or Tailscale.
+### Reaching it, safely
+
+The dashboard can add block rules, flush the DNS cache and trigger downloads,
+so it binds **loopback only** by default. Two ways to use it from another
+machine:
+
+**SSH tunnel — nothing exposed, nothing to configure:**
+
+```bash
+ssh -L 8080:localhost:8080 pi@raspberrypi
+# then browse to http://localhost:8080
+```
+
+**Or bind it to the LAN, which requires a token:**
+
+```toml
+[web]
+listen = "0.0.0.0:8080"
+admin_token = "<output of: openssl rand -hex 32>"   # min 16 chars
+```
+
+netwatch **refuses to start** if `listen` is off-loopback without a token —
+the one combination that would silently expose rule changes to the network.
+
+Read-only endpoints stay open so the dashboard renders immediately; the
+browser asks for the token the first time you change something and keeps it in
+`sessionStorage` (never in the page source, never returned by the API). The
+config file is installed `root:netwatch 0640` because it can hold that secret.
+
+This is a real boundary, not a substitute for one: still do not port-forward
+port 8080. For access away from home, use a VPN such as WireGuard or
+Tailscale.
 
 ### API
 
@@ -263,6 +310,34 @@ Everything the dashboard shows is available as JSON:
 | `POST`/`DELETE` `/api/deny` · `/api/allow` | `{"domain": "..."}` — applies immediately |
 | `POST /api/reload` | Re-download blocklists |
 | `POST /api/flush-cache` | Drop the DNS cache |
+
+## Upgrading
+
+Two defaults changed because the old ones were unsafe, not because the
+behaviour was wrong for everyone. Both are one line to restore.
+
+| Changed | Why | To restore the old behaviour |
+|---|---|---|
+| `web.listen` is now `127.0.0.1:8080` (was `0.0.0.0:8080`) | Unauthenticated endpoints that rewrite DNS policy were reachable from the whole LAN | Set `listen = "0.0.0.0:8080"` **and** an `admin_token` — see [Reaching it, safely](#reaching-it-safely) |
+| `discovery.dhcp` is now `false` (was `true`) | A UDP/67 socket shares a reuseport group with any same-user DHCP server, and losing household DHCP is worse than losing hostnames | Set `dhcp = true` if nothing else on the Pi serves DHCP (`sudo ss -ulnp \| grep :67`) |
+
+`cache_min_ttl` also changed meaning. It used to round short TTLs *up*, so a
+5-second record was served for 30 — a cache handing out a longer life than the
+authority granted. It is now a "don't cache anything shorter than this"
+threshold. If you want the old (incorrect) caching of very short TTLs, set
+`cache_min_ttl = 0` to cache them at their real TTL instead.
+
+Databases created before this version keep SQLite's `auto_vacuum = NONE` and
+cannot be switched in place, so pruning frees space inside the file without
+shrinking it. The dashboard marks these "fixed size". To rebuild one (takes a
+few minutes on an SD card, and DNS keeps working throughout because netwatch
+reopens it afterwards):
+
+```bash
+sudo systemctl stop netwatch
+sudo -u netwatch sqlite3 /var/lib/netwatch/netwatch.db "PRAGMA auto_vacuum=INCREMENTAL; VACUUM;"
+sudo systemctl start netwatch
+```
 
 ## Configuration
 
