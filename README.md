@@ -343,8 +343,20 @@ sudo systemctl start netwatch
 
 `/etc/netwatch/config.toml`, all keys optional — see
 [`config.example.toml`](config.example.toml) for the full annotated set.
-`systemctl restart netwatch` after editing, or `netwatch --print-config` to see
-what is in effect.
+`netwatch --print-config` shows what is in effect.
+
+**Always check the config before restarting.** netwatch is the whole network's
+resolver, so a config it cannot parse takes DNS down for every device — and
+systemd cannot recover from that, it just restarts into the same broken file:
+
+```bash
+sudo netwatch --config /etc/netwatch/config.toml --check-config \
+  && sudo systemctl restart netwatch
+```
+
+`--check-config` exits 0 with `config OK`, or 1 with the parse or validation
+error and the line it is on. The installer runs the same check and refuses to
+restart a working service with a config that would not come back up.
 
 Common adjustments:
 
@@ -393,6 +405,7 @@ journalctl -u netwatch -n 100 --no-pager
 | Devices show as `unnamed` | Normal for IoT gear that announces no name; the vendor column still identifies it |
 | `mDNS discovery unavailable` | Avahi already owns port 5353. Harmless; DHCP and reverse DNS still name devices |
 | One device logs nothing | It is probably using DoH or a hardcoded resolver |
+| Restarting in a loop, or `Active: failed` after several tries | Almost always a bad config. `netwatch --check-config` names the line; `journalctl -u netwatch` shows the same error. systemd stops after 5 failed starts in 5 minutes rather than looping silently |
 
 Run in the foreground to debug:
 

@@ -51,6 +51,63 @@ struct Cli {
     /// Print the effective configuration as TOML and exit.
     #[arg(long)]
     print_config: bool,
+
+    /// Validate the config file and exit: 0 if netwatch would start with it,
+    /// 1 with the reason if not. Run this before restarting the service.
+    #[arg(long)]
+    check_config: bool,
+}
+
+/// Apply the command-line overrides on top of a loaded config.
+///
+/// Shared by the real startup path and `--check-config`, so the check
+/// validates exactly what a start would use rather than the file alone.
+fn apply_overrides(cfg: &mut config::Config, cli: &Cli) {
+    if let Some(a) = cli.dns_listen {
+        cfg.dns.listen = a;
+    }
+    if let Some(a) = cli.web_listen {
+        cfg.web.listen = a;
+    }
+    if let Some(p) = &cli.database {
+        cfg.storage.database = p.clone();
+    }
+}
+
+/// Report whether netwatch would start with this config, in a form a shell
+/// script can gate on.
+///
+/// This exists because a bad config is the one failure that takes DNS down for
+/// the entire network: the process exits, systemd restarts it into the same
+/// broken file, and every device sits without name resolution. `systemctl
+/// restart` offers no chance to notice beforehand, so this does.
+fn check_config(cli: &Cli, loaded: Result<config::Config>) -> Result<()> {
+    let path = cli.config.display();
+
+    // load_or_default() quietly falls back to built-in defaults for a missing
+    // file. That is right for starting up, but for a check it would report OK
+    // on a mistyped path, which is precisely the mistake worth catching.
+    if !cli.config.exists() {
+        println!("config not found: {path} (netwatch would start on built-in defaults)");
+        return Ok(());
+    }
+
+    let result = loaded.and_then(|mut cfg| {
+        apply_overrides(&mut cfg, cli);
+        cfg.validate()?;
+        Ok(())
+    });
+
+    match result {
+        Ok(()) => {
+            println!("config OK: {path}");
+            Ok(())
+        }
+        Err(e) => {
+            eprintln!("config INVALID: {path}\n\n{e:#}");
+            std::process::exit(1);
+        }
+    }
 }
 
 #[tokio::main]
@@ -72,17 +129,16 @@ async fn main() -> Result<()> {
     }
 
     let cli = Cli::parse();
-    let mut cfg = config::Config::load_or_default(Some(&cli.config))?;
 
-    if let Some(a) = cli.dns_listen {
-        cfg.dns.listen = a;
+    // Taken before `?` unwraps it: --check-config has to report a parse failure
+    // as its own readable verdict, not as a propagated error trace.
+    let loaded = config::Config::load_or_default(Some(&cli.config));
+    if cli.check_config {
+        return check_config(&cli, loaded);
     }
-    if let Some(a) = cli.web_listen {
-        cfg.web.listen = a;
-    }
-    if let Some(p) = cli.database {
-        cfg.storage.database = p;
-    }
+
+    let mut cfg = loaded?;
+    apply_overrides(&mut cfg, &cli);
 
     if cli.print_config {
         println!("{}", toml::to_string_pretty(&cfg)?);

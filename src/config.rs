@@ -239,7 +239,7 @@ impl Config {
         }
     }
 
-    fn validate(&self) -> Result<()> {
+    pub(crate) fn validate(&self) -> Result<()> {
         anyhow::ensure!(
             !self.dns.upstreams.is_empty(),
             "dns.upstreams must not be empty"

@@ -75,6 +75,16 @@ fi
 install -d -m 0750 -o "$SVC_USER" -g "$SVC_USER" "$STATE_DIR"
 install -d -m 0750 -o "$SVC_USER" -g "$SVC_USER" "$STATE_DIR/lists"
 
+# --- config check -----------------------------------------------------------
+# Before touching a running service, prove it would come back up. Restarting
+# into a config netwatch cannot parse leaves the whole LAN without DNS, and
+# systemd cannot fix that by retrying — it just retries the same broken file.
+# A stale-but-serving netwatch beats a stopped one every time.
+info "validating $CONF"
+if ! "$BIN_DEST" --config "$CONF" --check-config; then
+  die "config is not valid — leaving the running service untouched. Fix the above, then re-run."
+fi
+
 # --- unit -------------------------------------------------------------------
 info "installing $UNIT"
 install -m 0644 deploy/netwatch.service "$UNIT"
@@ -106,7 +116,12 @@ $(info "netwatch is running")
 
   Dashboard   http://localhost:8080  (on the Pi; see below for remote access)
   Logs        journalctl -u netwatch -f
-  Config      $CONF   (systemctl restart netwatch after editing)
+  Config      $CONF
+
+After editing the config, check it before restarting — an unparseable config
+takes DNS down for every device on the network, and systemd cannot recover it:
+
+      sudo netwatch --config $CONF --check-config && sudo systemctl restart netwatch
 
 The dashboard listens on loopback only by default, because it can change block
 rules and flush the DNS cache. To reach it from another machine, either:
