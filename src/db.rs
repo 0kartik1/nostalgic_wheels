@@ -687,6 +687,62 @@ pub struct DeviceRow {
     pub blocked_24h: i64,
 }
 
+/// A device that is present on the network but barely resolving anything.
+#[derive(Debug, Clone, Serialize)]
+pub struct BypassSuspect {
+    pub mac: String,
+    pub ip: Option<String>,
+    pub hostname: Option<String>,
+    pub vendor: Option<String>,
+    pub last_seen: i64,
+    pub queries: i64,
+}
+
+/// Devices discovery can see, but which have sent almost no DNS.
+///
+/// This is the closest we can get to detecting a client that resolves past us
+/// — via DNS-over-HTTPS, or a hardcoded resolver. We cannot observe the
+/// bypassing traffic itself; we can only notice that a device is demonstrably
+/// present (ARP, mDNS or a sweep reached it inside the window) while asking us
+/// nothing. That is a signal, not proof: a genuinely idle device looks the
+/// same, which is why the dashboard presents these as suspects.
+///
+/// The per-device count is a correlated subquery rather than a
+/// `JOIN ... GROUP BY` on purpose. `devices.ip` carries no uniqueness
+/// constraint, so a join can fan out and inflate counts — the same hazard
+/// already fixed once in the query log.
+pub fn bypass_suspects(
+    conn: &Connection,
+    window_hours: u32,
+    max_queries: i64,
+    limit: u32,
+) -> Result<Vec<BypassSuspect>> {
+    let cutoff = now() - i64::from(window_hours) * 3600;
+    let mut stmt = conn.prepare(
+        "SELECT mac, ip, hostname, vendor, last_seen, queries FROM (
+             SELECT d.mac, d.ip, d.hostname, d.vendor, d.last_seen,
+                    (SELECT COUNT(*) FROM queries q
+                      WHERE q.client_ip = d.ip AND q.ts >= ?1) AS queries
+             FROM devices d
+             WHERE d.last_seen >= ?1 AND d.ip IS NOT NULL
+         )
+         WHERE queries <= ?2
+         ORDER BY queries ASC, last_seen DESC
+         LIMIT ?3",
+    )?;
+    let rows = stmt.query_map(params![cutoff, max_queries, limit], |r| {
+        Ok(BypassSuspect {
+            mac: r.get(0)?,
+            ip: r.get(1)?,
+            hostname: r.get(2)?,
+            vendor: r.get(3)?,
+            last_seen: r.get(4)?,
+            queries: r.get(5)?,
+        })
+    })?;
+    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+}
+
 /// Identity fields of every device already on record.
 ///
 /// Deliberately lighter than [`DeviceRow`]: this runs once at startup to seed
@@ -807,6 +863,95 @@ mod tests {
             answer: None,
             blocklist: None,
         })
+    }
+
+    /// A device that is present but silent is the signature this panel exists
+    /// to surface; a busy one must never appear beside it.
+    #[test]
+    fn bypass_suspects_finds_the_present_but_silent_device() {
+        let mut conn = open(Path::new(":memory:")).unwrap();
+        let seen = now();
+
+        let present = |mac: &str, ip: &str, host: &str| WriteOp::Device {
+            mac: mac.to_string(),
+            ip: Some(ip.to_string()),
+            hostname: Some(host.to_string()),
+            vendor: Some("Test".to_string()),
+            randomized: false,
+            ts: seen,
+        };
+        flush(
+            &mut conn,
+            &[
+                present("aa:bb:cc:00:00:01", "192.168.1.50", "chatty-laptop"),
+                present("aa:bb:cc:00:00:02", "192.168.1.51", "silent-tv"),
+            ],
+        )
+        .unwrap();
+
+        // Only the laptop actually asks us anything.
+        let traffic: Vec<WriteOp> = (0..50)
+            .map(|i| query("192.168.1.50", &format!("host{i}.example.com")))
+            .collect();
+        flush(&mut conn, &traffic).unwrap();
+
+        let suspects = bypass_suspects(&conn, 24, 5, 20).unwrap();
+        assert_eq!(suspects.len(), 1, "only the silent device is a suspect");
+        assert_eq!(suspects[0].mac, "aa:bb:cc:00:00:02");
+        assert_eq!(suspects[0].queries, 0);
+    }
+
+    /// devices.ip has no uniqueness constraint, so a JOIN..GROUP BY here would
+    /// fan out and inflate the per-device count — the same defect already
+    /// fixed once in the query log. The correlated subquery must not.
+    #[test]
+    fn bypass_suspect_counts_do_not_fan_out_across_devices() {
+        let mut conn = open(Path::new(":memory:")).unwrap();
+        let seen = now();
+        let at = |mac: &str, ip: &str| WriteOp::Device {
+            mac: mac.to_string(),
+            ip: Some(ip.to_string()),
+            hostname: None,
+            vendor: None,
+            randomized: false,
+            ts: seen,
+        };
+
+        // Two devices that have historically shared one address.
+        flush(&mut conn, &[at("aa:bb:cc:00:00:01", "192.168.1.50")]).unwrap();
+        flush(&mut conn, &[at("a2:bb:cc:00:00:02", "192.168.1.50")]).unwrap();
+        flush(&mut conn, &[query("192.168.1.50", "example.com")]).unwrap();
+
+        let suspects = bypass_suspects(&conn, 24, 5, 20).unwrap();
+        for s in &suspects {
+            assert!(
+                s.queries <= 1,
+                "one query row must count once, got {} for {}",
+                s.queries,
+                s.mac
+            );
+        }
+    }
+
+    /// A device last seen long ago is not evidence of bypassing — it is just
+    /// gone. Only devices discovery reached inside the window qualify.
+    #[test]
+    fn bypass_suspects_ignores_devices_that_are_no_longer_around() {
+        let mut conn = open(Path::new(":memory:")).unwrap();
+        flush(
+            &mut conn,
+            &[WriteOp::Device {
+                mac: "aa:bb:cc:00:00:03".to_string(),
+                ip: Some("192.168.1.99".to_string()),
+                hostname: None,
+                vendor: None,
+                randomized: false,
+                ts: now() - 30 * 86_400,
+            }],
+        )
+        .unwrap();
+
+        assert!(bypass_suspects(&conn, 24, 5, 20).unwrap().is_empty());
     }
 
     #[test]

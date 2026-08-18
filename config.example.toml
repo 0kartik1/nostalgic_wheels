@@ -145,6 +145,10 @@ mode = "zero_ip"
 # point (~130k domains: ads plus malware).
 sources = [
   "https://raw.githubusercontent.com/StevenBlack/hosts/master/hosts",
+  # Known DNS-over-HTTPS endpoints. Blocking these pushes devices that would
+  # otherwise resolve past you back onto system DNS. Not airtight — a client
+  # with a hardcoded IP still gets through — but it closes the easy cases.
+  # "https://raw.githubusercontent.com/dibdot/DoH-IP-blocklists/master/doh-domains.txt",
 ]
 
 # Extra lists you keep on disk. Hosts format or one domain per line; a leading
@@ -152,6 +156,14 @@ sources = [
 files = []
 
 refresh_hours = 24
+
+# Answer NXDOMAIN for use-application-dns.net, Mozilla's canary domain.
+# Firefox checks that name on every network it joins and switches its own
+# DNS-over-HTTPS off when the answer is NXDOMAIN, so its queries come back
+# through netwatch where you can see them. Without it Firefox resolves via
+# Cloudflare directly and the dashboard silently under-reports.
+# Set false if you would rather Firefox keep using DoH.
+disable_firefox_doh = true
 
 # Downloaded lists plus the dashboard-managed allow.list and deny.list.
 state_dir = "/var/lib/netwatch"

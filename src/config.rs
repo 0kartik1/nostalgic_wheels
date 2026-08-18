@@ -134,6 +134,17 @@ pub struct BlockingConfig {
     pub files: Vec<PathBuf>,
     /// Re-download `sources` this often.
     pub refresh_hours: u64,
+    /// Answer NXDOMAIN for `use-application-dns.net`, Mozilla's canary domain.
+    ///
+    /// Firefox checks that name on every network it joins and turns its own
+    /// DNS-over-HTTPS off when the answer is NXDOMAIN. Without this, Firefox
+    /// resolves through Cloudflare directly and netwatch sees none of its
+    /// queries — the dashboard looks healthy while silently not covering that
+    /// browser. On by default, because a DNS monitor that quietly under-reports
+    /// is worse than one that says what it cannot see.
+    ///
+    /// Set to false if you would rather Firefox keep using DoH.
+    pub disable_firefox_doh: bool,
     /// Where downloaded lists and the manual allow/deny lists live.
     pub state_dir: PathBuf,
 }
@@ -213,6 +224,7 @@ impl Default for BlockingConfig {
             ],
             files: Vec::new(),
             refresh_hours: 24,
+            disable_firefox_doh: true,
             state_dir: PathBuf::from("/var/lib/netwatch"),
         }
     }

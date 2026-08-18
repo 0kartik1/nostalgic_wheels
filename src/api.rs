@@ -125,6 +125,12 @@ const MAX_BODY_BYTES: usize = 16 * 1024;
 /// Ceiling on one HTTP request. The heaviest handler is a blocklist rebuild.
 const HTTP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
+/// At or below this many queries in the window, a device that is demonstrably
+/// on the network is treated as a possible bypass. Not zero: a phone that only
+/// ran a captive-portal check or an NTP lookup lands in single digits without
+/// being a real client of ours.
+const BYPASS_QUERY_THRESHOLD: i64 = 5;
+
 pub fn router(state: AppState) -> Router {
     // Anything that changes resolver behaviour: block rules, cache, lists.
     let mutating = Router::new()
@@ -147,6 +153,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/query-types", get(query_types))
         .route("/api/timeseries", get(timeseries))
         .route("/api/devices", get(devices))
+        .route("/api/bypass-suspects", get(bypass_suspects))
         .route("/api/interfaces", get(interfaces))
         .route("/api/status", get(status));
 
@@ -316,6 +323,25 @@ async fn top_clients(
     let (h, l) = (p.hours.unwrap_or(24), p.limit.unwrap_or(15));
     Ok(Json(
         with_db(&state, move |c| db::top_clients(c, h, l)).await?,
+    ))
+}
+
+/// Devices present on the network that are barely resolving anything — the
+/// visible signature of a client using DoH or a hardcoded resolver.
+async fn bypass_suspects(
+    State(state): State<AppState>,
+    Query(p): Query<RangeParams>,
+) -> ApiResult<Json<Vec<db::BypassSuspect>>> {
+    let hours = p.hours.unwrap_or(24).clamp(1, 24 * 30) as u32;
+    let limit = p.limit.unwrap_or(20).clamp(1, 200);
+    // A device that asked for nothing at all is the clearest case, but a
+    // handful of queries usually means a captive-portal check or an OS time
+    // sync rather than real use, so the threshold is not zero.
+    Ok(Json(
+        with_db(&state, move |c| {
+            db::bypass_suspects(c, hours, BYPASS_QUERY_THRESHOLD, limit)
+        })
+        .await?,
     ))
 }
 

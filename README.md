@@ -65,12 +65,36 @@ clients show as bare addresses rather than being silently dropped. If you want
 names, the practical answer today is to hand out only the IPv4 DNS server on
 the LAN, which is what most routers do anyway.
 
+<a id="devices-that-bypass-you"></a>
 **Devices can bypass you.** A device with a hardcoded DNS server, or using
-DNS-over-HTTPS (most modern browsers, on by default in some), will not appear
-in the log. Chrome and Firefox generally fall back to system DNS when the
-network's resolver looks like a filtering one, but phones and smart TVs
-sometimes ship their own. If a device shows suspiciously little traffic, that is
-usually why.
+DNS-over-HTTPS, never appears in the log at all — and the dashboard cannot tell
+the difference between "quiet device" and "device I am not seeing". That makes
+this the one caveat that can mislead you rather than merely limit you.
+
+Three things push back on it, in descending order of effectiveness:
+
+1. **The Firefox canary, on by default.** netwatch answers NXDOMAIN for
+   `use-application-dns.net`, which is Mozilla's documented signal for "this
+   network filters DNS". Firefox sees it and turns its own DoH off, so its
+   queries come back through netwatch. Set `blocking.disable_firefox_doh =
+   false` if you would rather it kept using DoH.
+2. **Blocking known DoH endpoints.** There is a commented source in
+   `config.example.toml` for a maintained list. This catches clients that
+   resolve their DoH provider by name, which is most of them, but not one with
+   a hardcoded IP.
+3. **Blocking DNS-over-TLS at the router**, by dropping outbound TCP and UDP
+   port **853**. DoT uses a dedicated port, so this is clean to block — unlike
+   DoH, which is indistinguishable from ordinary HTTPS on port 443.
+
+None of this is airtight against a device that genuinely does not want to be
+seen; a hardcoded resolver IP or DoH-over-443 will still get through. What it
+does do is close the accidental cases, which are the overwhelming majority.
+Chrome checks whether the system resolver supports DoH before upgrading and
+generally will not, so it is much less of a problem than Firefox was.
+
+Rather than leave the rest as guesswork, the dashboard has a **Bypass suspects**
+panel: devices that discovery can see on the network but that have resolved
+almost nothing. That is the signature of a device answering its own DNS.
 
 ### If you want true packet-level visibility later
 
@@ -319,6 +343,7 @@ behaviour was wrong for everyone. Both are one line to restore.
 | Changed | Why | To restore the old behaviour |
 |---|---|---|
 | `web.listen` is now `127.0.0.1:8080` (was `0.0.0.0:8080`) | Unauthenticated endpoints that rewrite DNS policy were reachable from the whole LAN | Set `listen = "0.0.0.0:8080"` **and** an `admin_token` — see [Reaching it, safely](#reaching-it-safely) |
+| `blocking.disable_firefox_doh` is new and defaults to `true` | Firefox's own DNS-over-HTTPS made its queries invisible, so the dashboard under-reported without saying so | Set `disable_firefox_doh = false` under `[blocking]` |
 | `discovery.dhcp` is now `false` (was `true`) | A UDP/67 socket shares a reuseport group with any same-user DHCP server, and losing household DHCP is worse than losing hostnames | Set `dhcp = true` if nothing else on the Pi serves DHCP (`sudo ss -ulnp \| grep :67`) |
 
 `cache_min_ttl` also changed meaning. It used to round short TTLs *up*, so a
@@ -404,7 +429,7 @@ journalctl -u netwatch -n 100 --no-pager
 | `0` blocked domains | First list download failed; check the log, then `POST /api/reload` |
 | Devices show as `unnamed` | Normal for IoT gear that announces no name; the vendor column still identifies it |
 | `mDNS discovery unavailable` | Avahi already owns port 5353. Harmless; DHCP and reverse DNS still name devices |
-| One device logs nothing | It is probably using DoH or a hardcoded resolver |
+| One device logs nothing | It is probably using DoH or a hardcoded resolver — see [Devices can bypass you](#devices-that-bypass-you) and the dashboard's Bypass suspects panel |
 | Restarting in a loop, or `Active: failed` after several tries | Almost always a bad config. `netwatch --check-config` names the line; `journalctl -u netwatch` shows the same error. systemd stops after 5 failed starts in 5 minutes rather than looping silently |
 
 Run in the foreground to debug:

@@ -27,6 +27,20 @@ use tokio::net::{TcpListener, UdpSocket};
 /// quickly, but not zero, to avoid hammering us in a retry loop.
 const BLOCK_TTL: u32 = 60;
 
+/// Mozilla's DoH canary domain.
+///
+/// Firefox resolves this name on every network it joins; an NXDOMAIN answer
+/// tells it the network operator runs a filtering resolver and it disables its
+/// built-in DNS-over-HTTPS. Documented at
+/// <https://support.mozilla.org/kb/canary-domain-use-application-dnsnet>.
+///
+/// Exact match only — Firefox queries this name and nothing beneath it.
+const FIREFOX_CANARY: &str = "use-application-dns.net";
+
+/// Shown in the query log so a canary answer is distinguishable from a
+/// blocklist hit without adding a column.
+const FIREFOX_CANARY_LABEL: &str = "firefox-doh-canary";
+
 #[derive(Debug, Default)]
 pub struct Stats {
     pub total: AtomicU64,
@@ -50,6 +64,7 @@ pub struct Resolver {
     /// instead of once per packet.
     warned_denied: std::sync::atomic::AtomicBool,
     block_nxdomain: bool,
+    disable_firefox_doh: bool,
     blocklist: Arc<RwLock<Blocklist>>,
     cache: Arc<std::sync::Mutex<cache::Cache>>,
     writer: Writer,
@@ -82,6 +97,7 @@ impl Resolver {
             acl,
             warned_denied: std::sync::atomic::AtomicBool::new(false),
             block_nxdomain: cfg.blocking.mode == "nxdomain",
+            disable_firefox_doh: cfg.blocking.disable_firefox_doh,
             blocklist,
             cache: Arc::new(std::sync::Mutex::new(cache::Cache::new(
                 cfg.dns.cache_max_entries,
@@ -232,6 +248,28 @@ impl Resolver {
             .to_ascii_lowercase();
         let qtype = query.query_type();
         let client_ip = client.ip();
+
+        // Mozilla's canary, checked before the blocklist because the answer is
+        // prescribed rather than a matter of policy.
+        if self.disable_firefox_doh && name == FIREFOX_CANARY {
+            let mut resp = base_response(&msg, payload_limit);
+            // Must be NXDOMAIN specifically. Under the default
+            // blocking.mode = "zero_ip" the sinkhole would answer 0.0.0.0,
+            // which Firefox reads as a working resolver and happily keeps DoH
+            // enabled. That is why this does not go through sinkhole().
+            resp.metadata.response_code = ResponseCode::NXDomain;
+            self.stats.blocked.fetch_add(1, Ordering::Relaxed);
+            self.log(
+                &name,
+                qtype,
+                client_ip,
+                QueryStatus::Blocked,
+                None,
+                None,
+                Some(FIREFOX_CANARY_LABEL.to_string()),
+            );
+            return encode(&resp);
+        }
 
         // Blocklist check comes first: no point spending an upstream round
         // trip on a name we are going to sinkhole.
@@ -1096,25 +1134,88 @@ mod tests {
         );
     }
 
+    /// The whole mechanism in one assertion: Firefox only disables its own
+    /// DoH on NXDOMAIN. Under the default blocking.mode = "zero_ip" a
+    /// blocklist hit answers 0.0.0.0, which Firefox reads as a working
+    /// resolver and keeps DoH on — so the canary must not go through
+    /// sinkhole(). If this regresses, netwatch silently stops seeing Firefox.
+    #[tokio::test]
+    async fn the_firefox_canary_is_nxdomain_even_in_zero_ip_mode() {
+        let mut cfg = crate::config::Config::default();
+        assert_eq!(cfg.blocking.mode, "zero_ip", "precondition: the default");
+        cfg.blocking.disable_firefox_doh = true;
+        let resolver = test_resolver(&cfg);
+
+        let raw = query_bytes("use-application-dns.net.", RecordType::A);
+        let out = resolver
+            .handle(&raw, "127.0.0.1:5300".parse().unwrap())
+            .await
+            .expect("must answer");
+        let resp = Message::from_vec(&out).unwrap();
+
+        assert_eq!(
+            resp.metadata.response_code,
+            ResponseCode::NXDomain,
+            "0.0.0.0 would leave Firefox on DoH"
+        );
+        assert!(
+            resp.answers.is_empty(),
+            "NXDOMAIN carries no answer records"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_canary_is_left_alone_when_disabled() {
+        let mut cfg = crate::config::Config::default();
+        cfg.blocking.disable_firefox_doh = false;
+        // No upstream reachable from a test, so this fails rather than
+        // resolving — the point is only that it is *not* short-circuited to
+        // NXDOMAIN by us.
+        cfg.dns.upstreams = vec!["127.0.0.1:1".parse().unwrap()];
+        cfg.dns.upstream_timeout_ms = 50;
+        cfg.dns.request_timeout_ms = 500;
+        let resolver = test_resolver(&cfg);
+
+        let raw = query_bytes("use-application-dns.net.", RecordType::A);
+        let out = resolver
+            .handle(&raw, "127.0.0.1:5300".parse().unwrap())
+            .await
+            .expect("must answer");
+        let resp = Message::from_vec(&out).unwrap();
+
+        assert_ne!(
+            resp.metadata.response_code,
+            ResponseCode::NXDomain,
+            "with the canary off we must not fabricate NXDOMAIN"
+        );
+    }
+
+    /// Only the exact name. Firefox queries this name and nothing beneath it,
+    /// and hijacking a whole subtree we were not asked about would be
+    /// overreach.
+    #[tokio::test]
+    async fn a_lookalike_subdomain_is_not_intercepted() {
+        let mut cfg = crate::config::Config::default();
+        cfg.dns.upstreams = vec!["127.0.0.1:1".parse().unwrap()];
+        cfg.dns.upstream_timeout_ms = 50;
+        cfg.dns.request_timeout_ms = 500;
+        let resolver = test_resolver(&cfg);
+
+        let raw = query_bytes("foo.use-application-dns.net.", RecordType::A);
+        let out = resolver
+            .handle(&raw, "127.0.0.1:5300".parse().unwrap())
+            .await
+            .expect("must answer");
+        let resp = Message::from_vec(&out).unwrap();
+
+        assert_ne!(resp.metadata.response_code, ResponseCode::NXDomain);
+    }
+
     #[test]
     fn sinkhole_returns_null_address_for_a() {
         let request = Message::from_vec(&query_bytes("ads.example.com.", RecordType::A)).unwrap();
         let cfg = crate::config::Config::default();
-        let resolver = Resolver {
-            cfg: cfg.dns.clone(),
-            acl: acl::Acl::parse(&cfg.dns.allow_from).unwrap(),
-            warned_denied: std::sync::atomic::AtomicBool::new(false),
-            block_nxdomain: false,
-            blocklist: Arc::new(RwLock::new(Blocklist::default())),
-            cache: Arc::new(std::sync::Mutex::new(cache::Cache::new(10, 30, 300))),
-            writer: crate::db::spawn_writer(
-                crate::db::open(std::path::Path::new(":memory:")).unwrap(),
-                std::time::Duration::from_millis(10),
-                1,
-            ),
-            devices: DeviceStore::new_for_test(),
-            stats: Arc::new(Stats::default()),
-        };
+        let resolver = test_resolver(&cfg);
 
         let resp = resolver.sinkhole(&request, RecordType::A);
         assert_eq!(resp.metadata.response_code, ResponseCode::NoError);
@@ -1143,7 +1244,10 @@ mod tests {
             cfg: cfg.dns.clone(),
             acl: acl::Acl::parse(&cfg.dns.allow_from).unwrap(),
             warned_denied: std::sync::atomic::AtomicBool::new(false),
-            block_nxdomain: false,
+            // Derived from cfg rather than hardcoded, so a test can set
+            // blocking.mode or disable_firefox_doh and have it take effect.
+            block_nxdomain: cfg.blocking.mode == "nxdomain",
+            disable_firefox_doh: cfg.blocking.disable_firefox_doh,
             blocklist: Arc::new(RwLock::new(Blocklist::default())),
             cache: Arc::new(std::sync::Mutex::new(cache::Cache::new(10, 30, 300))),
             writer: crate::db::spawn_writer(
