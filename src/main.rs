@@ -4,6 +4,7 @@
 //! packet sniffer: a Pi plugged into a switch port cannot see other devices'
 //! traffic, but it can serve their DNS.
 
+mod alerts;
 mod api;
 mod blocklist;
 mod config;
@@ -194,7 +195,14 @@ async fn main() -> Result<()> {
         }
     }
     tracing::info!("{} MAC vendor prefixes available", oui_db.len());
-    let device_store = devices::DeviceStore::new(oui_db, writer.clone());
+    // ---- alerting ----------------------------------------------------------
+    // Built before the device store so first-sighting alerts can be raised from
+    // discovery, and before the resolver so nothing has to be rewired later.
+    let alert_pair = alerts::spawn(&cfg.alerts, writer.clone());
+    let alert_sink = alert_pair.as_ref().map(|(s, _)| s.clone());
+
+    let device_store =
+        devices::DeviceStore::new(oui_db, writer.clone()).with_alerts(alert_sink.clone());
 
     // Load what we already know before any discovery runs. Beyond filling the
     // dashboard immediately, this is what makes "have we seen this MAC before"
@@ -287,6 +295,19 @@ async fn main() -> Result<()> {
     }
 
     tasks.push(tokio::spawn(dns::cache_sweeper(Arc::clone(&resolver))));
+
+    if let Some((sink, drain)) = alert_pair {
+        tasks.push(drain);
+        if cfg.alerts.nxdomain_storm {
+            tasks.push(tokio::spawn(alerts::storm_watcher(
+                Arc::clone(&read_handle),
+                sink,
+                cfg.alerts.nxdomain_window_mins,
+                cfg.alerts.nxdomain_threshold,
+                Duration::from_secs(cfg.alerts.scan_interval_secs.max(30)),
+            )));
+        }
+    }
 
     if cfg.discovery.arp {
         let store = device_store.clone();

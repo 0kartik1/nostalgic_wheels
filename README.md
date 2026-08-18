@@ -335,6 +335,41 @@ Everything the dashboard shows is available as JSON:
 | `POST /api/reload` | Re-download blocklists |
 | `POST /api/flush-cache` | Drop the DNS cache |
 
+## Alerts
+
+The dashboard only reports to whoever is looking at it. Two conditions get
+pushed instead:
+
+- **A new device joins the network.** The security-relevant event on a home
+  LAN. netwatch loads every MAC it already knows at startup, so a restart does
+  not re-announce your whole household — only a genuinely unseen MAC alerts.
+- **A client emits an NXDOMAIN storm.** Hundreds of failed lookups from one
+  device in a few minutes is the classic shape of malware walking a generated
+  domain list hunting for its command-and-control host. A broken app can do the
+  same, so this is a lead, not a verdict.
+
+Alerts are always recorded and shown on the dashboard. To also get them on a
+phone, point `alerts.ntfy_url` at an [ntfy](https://ntfy.sh) topic:
+
+```toml
+[alerts]
+ntfy_url = "https://ntfy.sh/netwatch-4f9c2a71b3"
+```
+
+Pick an unguessable topic name. Anyone who knows the URL can both read your
+alerts and publish to the topic, so it is a secret — netwatch never logs it and
+never returns it from the API, and the installer keeps `config.toml` at
+`root:netwatch 0640`.
+
+A persistent condition alerts once per `cooldown_mins` rather than once per
+scan. Delivery is best-effort: if ntfy is unreachable the alert is still
+recorded, and the dashboard shows it as not pushed. There is no retry, because
+a wedged notifier must never back up behind attempts nobody is waiting for.
+
+**netwatch cannot alert that netwatch is down.** Nothing running inside the
+process can. If that matters, point an external uptime check at the Pi — a
+scheduled `nslookup github.com <pi-ip>` from another machine is enough.
+
 ## Upgrading
 
 Two defaults changed because the old ones were unsafe, not because the

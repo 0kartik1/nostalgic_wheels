@@ -154,6 +154,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/timeseries", get(timeseries))
         .route("/api/devices", get(devices))
         .route("/api/bypass-suspects", get(bypass_suspects))
+        .route("/api/alerts", get(alerts))
         .route("/api/interfaces", get(interfaces))
         .route("/api/status", get(status));
 
@@ -324,6 +325,19 @@ async fn top_clients(
     Ok(Json(
         with_db(&state, move |c| db::top_clients(c, h, l)).await?,
     ))
+}
+
+/// Recorded alerts, newest first.
+///
+/// Read-only and unauthenticated like the rest of the reporting endpoints. The
+/// ntfy URL is deliberately not exposed anywhere: it is a shared secret that
+/// grants both read and publish access to the topic.
+async fn alerts(
+    State(state): State<AppState>,
+    Query(p): Query<RangeParams>,
+) -> ApiResult<Json<Vec<db::AlertRow>>> {
+    let limit = p.limit.unwrap_or(50).clamp(1, 500);
+    Ok(Json(with_db(&state, move |c| db::alerts(c, limit)).await?))
 }
 
 /// Devices present on the network that are barely resolving anything — the

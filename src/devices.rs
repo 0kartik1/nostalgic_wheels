@@ -121,6 +121,10 @@ pub struct DeviceStore {
     inner: Arc<RwLock<Inner>>,
     oui: Arc<OuiDb>,
     writer: Option<Writer>,
+    /// Raised on the first sighting of a MAC. Only meaningful because
+    /// [`DeviceStore::hydrate`] loads what we already know at startup —
+    /// without it every device would look new after a restart.
+    alerts: Option<crate::alerts::AlertSink>,
 }
 
 impl DeviceStore {
@@ -129,7 +133,15 @@ impl DeviceStore {
             inner: Arc::new(RwLock::new(Inner::default())),
             oui: Arc::new(oui),
             writer: Some(writer),
+            alerts: None,
         }
+    }
+
+    /// Attach an alert sink. Separate from `new` because the sink is built
+    /// after the writer it depends on.
+    pub fn with_alerts(mut self, sink: Option<crate::alerts::AlertSink>) -> Self {
+        self.alerts = sink;
+        self
     }
 
     #[cfg(test)]
@@ -138,6 +150,7 @@ impl DeviceStore {
             inner: Arc::new(RwLock::new(Inner::default())),
             oui: Arc::new(OuiDb::new()),
             writer: None,
+            alerts: None,
         }
     }
 
@@ -211,7 +224,7 @@ impl DeviceStore {
             return;
         };
 
-        let dev = {
+        let (dev, first_sighting) = {
             let Ok(mut inner) = self.inner.write() else {
                 return;
             };
@@ -226,6 +239,10 @@ impl DeviceStore {
                 self.oui.lookup(&mac).map(|s| s.to_string())
             };
 
+            // Checked before the entry is created, so this is genuinely "we
+            // have no record of this MAC" rather than "we just made one".
+            let is_new = !inner.by_mac.contains_key(&mac);
+
             let entry = inner.by_mac.entry(mac.clone()).or_insert_with(|| Device {
                 mac: mac.clone(),
                 ..Device::default()
@@ -238,11 +255,26 @@ impl DeviceStore {
             if let Some(name) = pending {
                 entry.hostname = Some(name);
             }
-            entry.take_write_slot(Instant::now()).then(|| entry.clone())
+            let snapshot = entry.clone();
+            (
+                entry
+                    .take_write_slot(Instant::now())
+                    .then(|| snapshot.clone()),
+                is_new.then_some(snapshot),
+            )
         };
 
         if let Some(d) = dev {
             self.persist(&d);
+        }
+        // Raised outside the lock: delivery is someone else's problem and must
+        // not be done while holding the registry.
+        if let (Some(d), Some(sink)) = (first_sighting, &self.alerts) {
+            sink.raise(crate::alerts::Alert::new_device(
+                &d.mac,
+                d.hostname.as_deref(),
+                d.vendor.as_deref(),
+            ));
         }
     }
 
@@ -986,6 +1018,52 @@ mod tests {
         assert!(
             !dev.take_write_slot(Instant::now()),
             "an unchanged device loaded at startup must not be rewritten"
+        );
+    }
+
+    /// The scenario this whole feature has to survive: netwatch restarts on a
+    /// network of ten devices and must not fire ten "new device" alerts. Every
+    /// user would turn alerting off after the first reboot.
+    #[tokio::test]
+    async fn a_restart_does_not_alert_for_devices_we_already_knew() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+        let sink = crate::alerts::AlertSink::for_test(tx, Duration::from_secs(3600));
+        let store = DeviceStore::new_for_test().with_alerts(Some(sink));
+
+        // What the database already held before the restart.
+        store.hydrate(vec![
+            known("b8:27:eb:11:22:33", Some("192.168.1.5")),
+            known("b8:27:eb:44:55:66", Some("192.168.1.6")),
+        ]);
+
+        // Discovery re-finds both of them straight after boot.
+        store.observe(Ipv4Addr::new(192, 168, 1, 5), "b8:27:eb:11:22:33");
+        store.observe(Ipv4Addr::new(192, 168, 1, 6), "b8:27:eb:44:55:66");
+
+        assert!(
+            rx.try_recv().is_err(),
+            "a device already on record is not new, however recently we restarted"
+        );
+    }
+
+    /// ...while a MAC that really is unknown still raises one.
+    #[tokio::test]
+    async fn a_genuinely_new_device_alerts_once() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+        let sink = crate::alerts::AlertSink::for_test(tx, Duration::from_secs(3600));
+        let store = DeviceStore::new_for_test().with_alerts(Some(sink));
+
+        store.hydrate(vec![known("b8:27:eb:11:22:33", Some("192.168.1.5"))]);
+        store.observe(Ipv4Addr::new(192, 168, 1, 9), "aa:bb:cc:dd:ee:ff");
+
+        let got = rx.try_recv().expect("an unknown MAC must alert");
+        assert_eq!(got.subject, "aa:bb:cc:dd:ee:ff");
+
+        // Seeing it repeatedly is the same device, not a new one each time.
+        store.observe(Ipv4Addr::new(192, 168, 1, 9), "aa:bb:cc:dd:ee:ff");
+        assert!(
+            rx.try_recv().is_err(),
+            "a second sighting is not a new device"
         );
     }
 

@@ -74,6 +74,16 @@ pub enum WriteOp {
         target: String,
         ms: f64,
     },
+    /// A recorded alert. Rides the same batched writer as everything else so
+    /// there is only one write path to the database.
+    Alert {
+        ts: i64,
+        kind: String,
+        severity: String,
+        subject: String,
+        detail: String,
+        notified: bool,
+    },
     /// Upsert a device. `None` fields leave the existing value alone.
     Device {
         mac: String,
@@ -130,6 +140,17 @@ CREATE TABLE IF NOT EXISTS iface_samples (
     tx_bps   INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_iface_ts ON iface_samples(ts DESC);
+
+CREATE TABLE IF NOT EXISTS alerts (
+    id       INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts       INTEGER NOT NULL,
+    kind     TEXT    NOT NULL,
+    severity TEXT    NOT NULL,
+    subject  TEXT    NOT NULL,
+    detail   TEXT    NOT NULL,
+    notified INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_alerts_ts ON alerts(ts DESC);
 
 CREATE TABLE IF NOT EXISTS latency (
     ts     INTEGER NOT NULL,
@@ -212,6 +233,7 @@ pub struct DropCounts {
     pub queries: AtomicU64,
     pub devices: AtomicU64,
     pub monitoring: AtomicU64,
+    pub alerts: AtomicU64,
 }
 
 #[derive(Clone)]
@@ -229,6 +251,10 @@ impl Writer {
             WriteOp::Query(_) => &self.dropped.queries,
             WriteOp::Device { .. } => &self.dropped.devices,
             WriteOp::Iface(_) | WriteOp::Latency { .. } => &self.dropped.monitoring,
+            // Alerts are rare and each one is a thing somebody wanted to know
+            // about, so a dropped alert is closer in severity to a dropped
+            // query than to a lost throughput sample.
+            WriteOp::Alert { .. } => &self.dropped.alerts,
         };
         if self.tx.try_send(op).is_err() {
             // Either the queue is saturated or we are shutting down. Losing a
@@ -334,8 +360,30 @@ fn flush(conn: &mut Connection, ops: &[WriteOp]) -> Result<()> {
                 last_seen = excluded.last_seen",
         )?;
 
+        let mut a = tx.prepare_cached(
+            "INSERT INTO alerts (ts, kind, severity, subject, detail, notified)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        )?;
+
         for op in ops {
             match op {
+                WriteOp::Alert {
+                    ts,
+                    kind,
+                    severity,
+                    subject,
+                    detail,
+                    notified,
+                } => {
+                    a.execute(params![
+                        ts,
+                        kind,
+                        severity,
+                        subject,
+                        detail,
+                        *notified as i64
+                    ])?;
+                }
                 WriteOp::Query(e) => {
                     q.execute(params![
                         e.ts,
@@ -376,6 +424,9 @@ fn flush(conn: &mut Connection, ops: &[WriteOp]) -> Result<()> {
     Ok(())
 }
 
+/// How long recorded alerts are kept, independent of storage.retention_days.
+const ALERT_RETENTION_DAYS: i64 = 90;
+
 fn prune(conn: &Connection, retention_days: u32) -> Result<()> {
     let cutoff = now() - (retention_days as i64) * 86_400;
     let q = conn.execute("DELETE FROM queries WHERE ts < ?1", params![cutoff])?;
@@ -386,6 +437,12 @@ fn prune(conn: &Connection, retention_days: u32) -> Result<()> {
         params![iface_cutoff],
     )?;
     conn.execute("DELETE FROM latency WHERE ts < ?1", params![iface_cutoff])?;
+    // Alerts outlive the query log they were derived from: they are a handful
+    // of rows describing things somebody wanted to know about, and "when did
+    // this device first appear" stays interesting long after the queries that
+    // triggered it have been pruned.
+    let alert_cutoff = now() - ALERT_RETENTION_DAYS * 86_400;
+    conn.execute("DELETE FROM alerts WHERE ts < ?1", params![alert_cutoff])?;
     if q > 0 {
         tracing::info!("pruned {q} query rows older than {retention_days}d");
     }
@@ -685,6 +742,61 @@ pub struct DeviceRow {
     pub last_seen: i64,
     pub queries_24h: i64,
     pub blocked_24h: i64,
+}
+
+/// One recorded alert, as shown on the dashboard.
+#[derive(Debug, Clone, Serialize)]
+pub struct AlertRow {
+    pub id: i64,
+    pub ts: i64,
+    pub kind: String,
+    pub severity: String,
+    pub subject: String,
+    pub detail: String,
+    pub notified: bool,
+}
+
+pub fn alerts(conn: &Connection, limit: u32) -> Result<Vec<AlertRow>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, ts, kind, severity, subject, detail, notified
+         FROM alerts ORDER BY ts DESC, id DESC LIMIT ?1",
+    )?;
+    let rows = stmt.query_map(params![limit], |r| {
+        Ok(AlertRow {
+            id: r.get(0)?,
+            ts: r.get(1)?,
+            kind: r.get(2)?,
+            severity: r.get(3)?,
+            subject: r.get(4)?,
+            detail: r.get(5)?,
+            notified: r.get::<_, i64>(6)? != 0,
+        })
+    })?;
+    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+}
+
+/// Clients that have racked up an unusual number of NXDOMAIN answers.
+///
+/// A handful of NXDOMAINs is ordinary — mistyped names, search-domain
+/// suffixing, an app probing for a service. Hundreds from one client inside a
+/// few minutes is the classic shape of malware walking a generated domain list
+/// looking for whichever one its operator registered this week.
+///
+/// Returns (client_ip, count) over the threshold, worst first.
+pub fn nxdomain_offenders(
+    conn: &Connection,
+    window_mins: u32,
+    threshold: u32,
+) -> Result<Vec<(String, i64)>> {
+    let cutoff = now() - i64::from(window_mins) * 60;
+    let mut stmt = conn.prepare(
+        "SELECT client_ip, COUNT(*) n FROM queries
+         WHERE ts >= ?1 AND status = 'nxdomain'
+         GROUP BY client_ip HAVING n >= ?2
+         ORDER BY n DESC",
+    )?;
+    let rows = stmt.query_map(params![cutoff, threshold], |r| Ok((r.get(0)?, r.get(1)?)))?;
+    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
 }
 
 /// A device that is present on the network but barely resolving anything.
