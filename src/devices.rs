@@ -121,6 +121,10 @@ pub struct DeviceStore {
     inner: Arc<RwLock<Inner>>,
     oui: Arc<OuiDb>,
     writer: Option<Writer>,
+    /// Raised on the first sighting of a MAC. Only meaningful because
+    /// [`DeviceStore::hydrate`] loads what we already know at startup —
+    /// without it every device would look new after a restart.
+    alerts: Option<crate::alerts::AlertSink>,
 }
 
 impl DeviceStore {
@@ -129,7 +133,15 @@ impl DeviceStore {
             inner: Arc::new(RwLock::new(Inner::default())),
             oui: Arc::new(oui),
             writer: Some(writer),
+            alerts: None,
         }
+    }
+
+    /// Attach an alert sink. Separate from `new` because the sink is built
+    /// after the writer it depends on.
+    pub fn with_alerts(mut self, sink: Option<crate::alerts::AlertSink>) -> Self {
+        self.alerts = sink;
+        self
     }
 
     #[cfg(test)]
@@ -138,7 +150,60 @@ impl DeviceStore {
             inner: Arc::new(RwLock::new(Inner::default())),
             oui: Arc::new(OuiDb::new()),
             writer: None,
+            alerts: None,
         }
+    }
+
+    /// Seed the registry from the database at startup.
+    ///
+    /// Without this the store starts empty on every restart, with two
+    /// consequences. The dashboard shows an empty device list until ARP
+    /// sweeps slowly refill it — and, more importantly, anything keyed on
+    /// "we have never seen this MAC" cannot work, because after a restart
+    /// every device on the network looks new. New-device alerting depends
+    /// entirely on this.
+    ///
+    /// Hydrated devices are marked as already persisted, so a restart does
+    /// not rewrite every row: that would undo the write-debouncing this
+    /// module exists to do.
+    ///
+    /// Returns how many devices were loaded.
+    pub fn hydrate(&self, rows: Vec<crate::db::KnownDevice>) -> usize {
+        let Ok(mut inner) = self.inner.write() else {
+            return 0;
+        };
+        let now = Instant::now();
+        let mut loaded = 0;
+
+        for row in rows {
+            let Some(mac) = oui::normalize(&row.mac) else {
+                continue;
+            };
+            // A row whose IP no longer parses is still a device we know about;
+            // it just has no reverse index entry until we see it again.
+            let ip = row.ip.as_deref().and_then(|s| s.parse::<Ipv4Addr>().ok());
+
+            let mut dev = Device {
+                mac: mac.clone(),
+                ip,
+                hostname: row.hostname,
+                vendor: row.vendor,
+                randomized: row.randomized,
+                written_fingerprint: None,
+                last_seen_written: None,
+            };
+            // Mark as already written *after* the fields are set, so an
+            // unchanged sighting after startup is a no-op rather than a write.
+            dev.written_fingerprint = Some(dev.fingerprint());
+            dev.last_seen_written = Some(now);
+
+            if let Some(ip) = ip {
+                inner.ip_to_mac.insert(ip, mac.clone());
+            }
+            inner.by_mac.insert(mac, dev);
+            loaded += 1;
+        }
+        loaded
     }
 
     fn persist(&self, dev: &Device) {
@@ -159,7 +224,7 @@ impl DeviceStore {
             return;
         };
 
-        let dev = {
+        let (dev, first_sighting) = {
             let Ok(mut inner) = self.inner.write() else {
                 return;
             };
@@ -174,6 +239,10 @@ impl DeviceStore {
                 self.oui.lookup(&mac).map(|s| s.to_string())
             };
 
+            // Checked before the entry is created, so this is genuinely "we
+            // have no record of this MAC" rather than "we just made one".
+            let is_new = !inner.by_mac.contains_key(&mac);
+
             let entry = inner.by_mac.entry(mac.clone()).or_insert_with(|| Device {
                 mac: mac.clone(),
                 ..Device::default()
@@ -186,11 +255,26 @@ impl DeviceStore {
             if let Some(name) = pending {
                 entry.hostname = Some(name);
             }
-            entry.take_write_slot(Instant::now()).then(|| entry.clone())
+            let snapshot = entry.clone();
+            (
+                entry
+                    .take_write_slot(Instant::now())
+                    .then(|| snapshot.clone()),
+                is_new.then_some(snapshot),
+            )
         };
 
         if let Some(d) = dev {
             self.persist(&d);
+        }
+        // Raised outside the lock: delivery is someone else's problem and must
+        // not be done while holding the registry.
+        if let (Some(d), Some(sink)) = (first_sighting, &self.alerts) {
+            sink.raise(crate::alerts::Alert::new_device(
+                &d.mac,
+                d.hostname.as_deref(),
+                d.vendor.as_deref(),
+            ));
         }
     }
 
@@ -882,6 +966,116 @@ mod tests {
             writes_for(&store),
             1,
             "50 identical ARP sightings are one device, written once"
+        );
+    }
+
+    fn known(mac: &str, ip: Option<&str>) -> crate::db::KnownDevice {
+        crate::db::KnownDevice {
+            mac: mac.to_string(),
+            ip: ip.map(|s| s.to_string()),
+            hostname: Some("kitchen-ipad".to_string()),
+            vendor: Some("Apple".to_string()),
+            randomized: false,
+        }
+    }
+
+    /// The point of hydration: after a restart, a device already on record is
+    /// not "new". Everything built on first-sighting detection depends on this.
+    #[test]
+    fn hydrated_devices_are_not_treated_as_newly_seen() {
+        let store = DeviceStore::new_for_test();
+        let loaded = store.hydrate(vec![known("b8:27:eb:11:22:33", Some("192.168.1.5"))]);
+        assert_eq!(loaded, 1);
+
+        let inner = store.inner.read().unwrap();
+        assert!(
+            inner.by_mac.contains_key("b8:27:eb:11:22:33"),
+            "the MAC must be known before any discovery runs"
+        );
+        assert_eq!(
+            inner.ip_to_mac.get(&Ipv4Addr::new(192, 168, 1, 5)),
+            Some(&"b8:27:eb:11:22:33".to_string()),
+            "the reverse index must be seeded too, or DNS attribution stays \
+             blind until the next ARP poll"
+        );
+    }
+
+    /// Startup must not rewrite the whole devices table. Doing so on every
+    /// restart would undo the write debouncing this module exists for, which
+    /// on an SD card is the difference between a card that lasts and one that
+    /// does not.
+    #[test]
+    fn hydration_does_not_immediately_rewrite_every_row() {
+        let store = DeviceStore::new_for_test();
+        store.hydrate(vec![known("b8:27:eb:11:22:33", Some("192.168.1.5"))]);
+
+        // take_write_slot is the gate every persist goes through, so asking it
+        // directly is the real test. It must be asked *before* any sighting:
+        // the first observe() would itself mark the device, which would make
+        // this pass whether or not hydration marked anything.
+        let mut inner = store.inner.write().unwrap();
+        let dev = inner.by_mac.get_mut("b8:27:eb:11:22:33").unwrap();
+        assert!(
+            !dev.take_write_slot(Instant::now()),
+            "an unchanged device loaded at startup must not be rewritten"
+        );
+    }
+
+    /// The scenario this whole feature has to survive: netwatch restarts on a
+    /// network of ten devices and must not fire ten "new device" alerts. Every
+    /// user would turn alerting off after the first reboot.
+    #[tokio::test]
+    async fn a_restart_does_not_alert_for_devices_we_already_knew() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+        let sink = crate::alerts::AlertSink::for_test(tx, Duration::from_secs(3600));
+        let store = DeviceStore::new_for_test().with_alerts(Some(sink));
+
+        // What the database already held before the restart.
+        store.hydrate(vec![
+            known("b8:27:eb:11:22:33", Some("192.168.1.5")),
+            known("b8:27:eb:44:55:66", Some("192.168.1.6")),
+        ]);
+
+        // Discovery re-finds both of them straight after boot.
+        store.observe(Ipv4Addr::new(192, 168, 1, 5), "b8:27:eb:11:22:33");
+        store.observe(Ipv4Addr::new(192, 168, 1, 6), "b8:27:eb:44:55:66");
+
+        assert!(
+            rx.try_recv().is_err(),
+            "a device already on record is not new, however recently we restarted"
+        );
+    }
+
+    /// ...while a MAC that really is unknown still raises one.
+    #[tokio::test]
+    async fn a_genuinely_new_device_alerts_once() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+        let sink = crate::alerts::AlertSink::for_test(tx, Duration::from_secs(3600));
+        let store = DeviceStore::new_for_test().with_alerts(Some(sink));
+
+        store.hydrate(vec![known("b8:27:eb:11:22:33", Some("192.168.1.5"))]);
+        store.observe(Ipv4Addr::new(192, 168, 1, 9), "aa:bb:cc:dd:ee:ff");
+
+        let got = rx.try_recv().expect("an unknown MAC must alert");
+        assert_eq!(got.subject, "aa:bb:cc:dd:ee:ff");
+
+        // Seeing it repeatedly is the same device, not a new one each time.
+        store.observe(Ipv4Addr::new(192, 168, 1, 9), "aa:bb:cc:dd:ee:ff");
+        assert!(
+            rx.try_recv().is_err(),
+            "a second sighting is not a new device"
+        );
+    }
+
+    /// A row whose stored IP is unparseable must not lose us the device.
+    #[test]
+    fn hydration_survives_a_bad_ip_column() {
+        let store = DeviceStore::new_for_test();
+        let loaded = store.hydrate(vec![known("b8:27:eb:11:22:33", Some("not-an-ip"))]);
+        assert_eq!(loaded, 1, "the device is still known");
+        assert!(
+            store.inner.read().unwrap().ip_to_mac.is_empty(),
+            "but it has no reverse-index entry until seen again"
         );
     }
 

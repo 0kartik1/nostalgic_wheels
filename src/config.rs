@@ -14,6 +14,7 @@ pub struct Config {
     pub storage: StorageConfig,
     pub discovery: DiscoveryConfig,
     pub blocking: BlockingConfig,
+    pub alerts: AlertConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -134,8 +135,68 @@ pub struct BlockingConfig {
     pub files: Vec<PathBuf>,
     /// Re-download `sources` this often.
     pub refresh_hours: u64,
+    /// Answer NXDOMAIN for `use-application-dns.net`, Mozilla's canary domain.
+    ///
+    /// Firefox checks that name on every network it joins and turns its own
+    /// DNS-over-HTTPS off when the answer is NXDOMAIN. Without this, Firefox
+    /// resolves through Cloudflare directly and netwatch sees none of its
+    /// queries — the dashboard looks healthy while silently not covering that
+    /// browser. On by default, because a DNS monitor that quietly under-reports
+    /// is worse than one that says what it cannot see.
+    ///
+    /// Set to false if you would rather Firefox keep using DoH.
+    pub disable_firefox_doh: bool,
     /// Where downloaded lists and the manual allow/deny lists live.
     pub state_dir: PathBuf,
+}
+
+/// Notification of the handful of events worth interrupting someone for.
+///
+/// Deliberately narrow. A monitor that alerts on everything trains you to
+/// ignore it, so this covers two things: a device appearing on the network for
+/// the first time, and a client emitting an NXDOMAIN storm — the usual
+/// signature of malware resolving generated domains looking for its C2.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct AlertConfig {
+    /// Master switch. Alerts are still recorded when this is on but no
+    /// delivery target is set; they simply stay in the dashboard.
+    pub enabled: bool,
+    /// ntfy topic URL, e.g. "https://ntfy.sh/some-private-topic".
+    ///
+    /// Anyone who knows this URL can both read your alerts and publish to it,
+    /// so treat it as a secret: it is never logged and never returned by the
+    /// API. Empty means store alerts without pushing them anywhere.
+    pub ntfy_url: String,
+    /// Alert the first time a MAC is seen on the network.
+    pub new_device: bool,
+    /// Alert when one client racks up NXDOMAIN answers unusually fast.
+    pub nxdomain_storm: bool,
+    /// NXDOMAIN answers from a single client, within the window, to alert on.
+    pub nxdomain_threshold: u32,
+    pub nxdomain_window_mins: u32,
+    /// How often to evaluate the threshold conditions.
+    pub scan_interval_secs: u64,
+    /// Minimum gap between two alerts about the same subject and kind, so a
+    /// persistent condition reports once rather than once per scan.
+    pub cooldown_mins: u32,
+}
+
+impl Default for AlertConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            ntfy_url: String::new(),
+            new_device: true,
+            nxdomain_storm: true,
+            // A browser typo storm or a misconfigured app can produce a few
+            // dozen; hundreds in ten minutes is not a person typing.
+            nxdomain_threshold: 50,
+            nxdomain_window_mins: 10,
+            scan_interval_secs: 300,
+            cooldown_mins: 60,
+        }
+    }
 }
 
 impl Default for DnsConfig {
@@ -213,6 +274,7 @@ impl Default for BlockingConfig {
             ],
             files: Vec::new(),
             refresh_hours: 24,
+            disable_firefox_doh: true,
             state_dir: PathBuf::from("/var/lib/netwatch"),
         }
     }
@@ -239,7 +301,7 @@ impl Config {
         }
     }
 
-    fn validate(&self) -> Result<()> {
+    pub(crate) fn validate(&self) -> Result<()> {
         anyhow::ensure!(
             !self.dns.upstreams.is_empty(),
             "dns.upstreams must not be empty"
@@ -278,6 +340,21 @@ impl Config {
                 self.web.listen
             );
         }
+        if !self.alerts.ntfy_url.trim().is_empty() {
+            let u = self.alerts.ntfy_url.trim();
+            anyhow::ensure!(
+                u.starts_with("http://") || u.starts_with("https://"),
+                "alerts.ntfy_url must be a full http(s) URL such as \
+                 \"https://ntfy.sh/your-topic\", got {u:?}"
+            );
+        }
+        anyhow::ensure!(
+            self.alerts.nxdomain_threshold > 0
+                && self.alerts.nxdomain_window_mins > 0
+                && self.alerts.scan_interval_secs > 0,
+            "alerts.nxdomain_threshold, nxdomain_window_mins and scan_interval_secs \
+             must all be greater than zero"
+        );
         anyhow::ensure!(
             matches!(self.blocking.mode.as_str(), "zero_ip" | "nxdomain"),
             "blocking.mode must be \"zero_ip\" or \"nxdomain\", got {:?}",

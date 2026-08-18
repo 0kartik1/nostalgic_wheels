@@ -145,6 +145,10 @@ mode = "zero_ip"
 # point (~130k domains: ads plus malware).
 sources = [
   "https://raw.githubusercontent.com/StevenBlack/hosts/master/hosts",
+  # Known DNS-over-HTTPS endpoints. Blocking these pushes devices that would
+  # otherwise resolve past you back onto system DNS. Not airtight — a client
+  # with a hardcoded IP still gets through — but it closes the easy cases.
+  # "https://raw.githubusercontent.com/dibdot/DoH-IP-blocklists/master/doh-domains.txt",
 ]
 
 # Extra lists you keep on disk. Hosts format or one domain per line; a leading
@@ -153,5 +157,47 @@ files = []
 
 refresh_hours = 24
 
+# Answer NXDOMAIN for use-application-dns.net, Mozilla's canary domain.
+# Firefox checks that name on every network it joins and switches its own
+# DNS-over-HTTPS off when the answer is NXDOMAIN, so its queries come back
+# through netwatch where you can see them. Without it Firefox resolves via
+# Cloudflare directly and the dashboard silently under-reports.
+# Set false if you would rather Firefox keep using DoH.
+disable_firefox_doh = true
+
 # Downloaded lists plus the dashboard-managed allow.list and deny.list.
 state_dir = "/var/lib/netwatch"
+
+[alerts]
+# The handful of events worth interrupting someone for. Deliberately narrow: a
+# monitor that alerts on everything teaches you to ignore it.
+enabled = true
+
+# ntfy topic URL. Leave empty to record alerts in the dashboard without
+# pushing them anywhere. Install the ntfy app, pick an unguessable topic name,
+# and use it here:
+#   ntfy_url = "https://ntfy.sh/netwatch-4f9c2a71b3"
+#
+# Anyone who knows this URL can both read your alerts and publish to the topic,
+# so treat it as a secret — which is also why netwatch never logs it or returns
+# it from the API. config.toml is installed root:netwatch 0640 for this reason.
+ntfy_url = ""
+
+# A MAC appearing on the network for the first time. This is the
+# security-relevant event on a home LAN. Devices already in the database are
+# not "new", so a restart does not re-announce your whole household.
+new_device = true
+
+# One client racking up NXDOMAIN answers fast — the usual shape of malware
+# walking a generated domain list looking for its command-and-control host.
+# A broken app can do it too, so it is a warning rather than a verdict.
+nxdomain_storm = true
+nxdomain_threshold = 50
+nxdomain_window_mins = 10
+
+# How often the threshold conditions are evaluated.
+scan_interval_secs = 300
+
+# Minimum gap between two alerts about the same subject and kind, so an
+# ongoing condition reports once instead of once per scan.
+cooldown_mins = 60

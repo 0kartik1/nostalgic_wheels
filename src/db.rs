@@ -74,6 +74,16 @@ pub enum WriteOp {
         target: String,
         ms: f64,
     },
+    /// A recorded alert. Rides the same batched writer as everything else so
+    /// there is only one write path to the database.
+    Alert {
+        ts: i64,
+        kind: String,
+        severity: String,
+        subject: String,
+        detail: String,
+        notified: bool,
+    },
     /// Upsert a device. `None` fields leave the existing value alone.
     Device {
         mac: String,
@@ -130,6 +140,17 @@ CREATE TABLE IF NOT EXISTS iface_samples (
     tx_bps   INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_iface_ts ON iface_samples(ts DESC);
+
+CREATE TABLE IF NOT EXISTS alerts (
+    id       INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts       INTEGER NOT NULL,
+    kind     TEXT    NOT NULL,
+    severity TEXT    NOT NULL,
+    subject  TEXT    NOT NULL,
+    detail   TEXT    NOT NULL,
+    notified INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_alerts_ts ON alerts(ts DESC);
 
 CREATE TABLE IF NOT EXISTS latency (
     ts     INTEGER NOT NULL,
@@ -212,6 +233,7 @@ pub struct DropCounts {
     pub queries: AtomicU64,
     pub devices: AtomicU64,
     pub monitoring: AtomicU64,
+    pub alerts: AtomicU64,
 }
 
 #[derive(Clone)]
@@ -229,6 +251,10 @@ impl Writer {
             WriteOp::Query(_) => &self.dropped.queries,
             WriteOp::Device { .. } => &self.dropped.devices,
             WriteOp::Iface(_) | WriteOp::Latency { .. } => &self.dropped.monitoring,
+            // Alerts are rare and each one is a thing somebody wanted to know
+            // about, so a dropped alert is closer in severity to a dropped
+            // query than to a lost throughput sample.
+            WriteOp::Alert { .. } => &self.dropped.alerts,
         };
         if self.tx.try_send(op).is_err() {
             // Either the queue is saturated or we are shutting down. Losing a
@@ -334,8 +360,30 @@ fn flush(conn: &mut Connection, ops: &[WriteOp]) -> Result<()> {
                 last_seen = excluded.last_seen",
         )?;
 
+        let mut a = tx.prepare_cached(
+            "INSERT INTO alerts (ts, kind, severity, subject, detail, notified)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        )?;
+
         for op in ops {
             match op {
+                WriteOp::Alert {
+                    ts,
+                    kind,
+                    severity,
+                    subject,
+                    detail,
+                    notified,
+                } => {
+                    a.execute(params![
+                        ts,
+                        kind,
+                        severity,
+                        subject,
+                        detail,
+                        *notified as i64
+                    ])?;
+                }
                 WriteOp::Query(e) => {
                     q.execute(params![
                         e.ts,
@@ -376,6 +424,9 @@ fn flush(conn: &mut Connection, ops: &[WriteOp]) -> Result<()> {
     Ok(())
 }
 
+/// How long recorded alerts are kept, independent of storage.retention_days.
+const ALERT_RETENTION_DAYS: i64 = 90;
+
 fn prune(conn: &Connection, retention_days: u32) -> Result<()> {
     let cutoff = now() - (retention_days as i64) * 86_400;
     let q = conn.execute("DELETE FROM queries WHERE ts < ?1", params![cutoff])?;
@@ -386,6 +437,12 @@ fn prune(conn: &Connection, retention_days: u32) -> Result<()> {
         params![iface_cutoff],
     )?;
     conn.execute("DELETE FROM latency WHERE ts < ?1", params![iface_cutoff])?;
+    // Alerts outlive the query log they were derived from: they are a handful
+    // of rows describing things somebody wanted to know about, and "when did
+    // this device first appear" stays interesting long after the queries that
+    // triggered it have been pruned.
+    let alert_cutoff = now() - ALERT_RETENTION_DAYS * 86_400;
+    conn.execute("DELETE FROM alerts WHERE ts < ?1", params![alert_cutoff])?;
     if q > 0 {
         tracing::info!("pruned {q} query rows older than {retention_days}d");
     }
@@ -687,6 +744,146 @@ pub struct DeviceRow {
     pub blocked_24h: i64,
 }
 
+/// One recorded alert, as shown on the dashboard.
+#[derive(Debug, Clone, Serialize)]
+pub struct AlertRow {
+    pub id: i64,
+    pub ts: i64,
+    pub kind: String,
+    pub severity: String,
+    pub subject: String,
+    pub detail: String,
+    pub notified: bool,
+}
+
+pub fn alerts(conn: &Connection, limit: u32) -> Result<Vec<AlertRow>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, ts, kind, severity, subject, detail, notified
+         FROM alerts ORDER BY ts DESC, id DESC LIMIT ?1",
+    )?;
+    let rows = stmt.query_map(params![limit], |r| {
+        Ok(AlertRow {
+            id: r.get(0)?,
+            ts: r.get(1)?,
+            kind: r.get(2)?,
+            severity: r.get(3)?,
+            subject: r.get(4)?,
+            detail: r.get(5)?,
+            notified: r.get::<_, i64>(6)? != 0,
+        })
+    })?;
+    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+}
+
+/// Clients that have racked up an unusual number of NXDOMAIN answers.
+///
+/// A handful of NXDOMAINs is ordinary — mistyped names, search-domain
+/// suffixing, an app probing for a service. Hundreds from one client inside a
+/// few minutes is the classic shape of malware walking a generated domain list
+/// looking for whichever one its operator registered this week.
+///
+/// Returns (client_ip, count) over the threshold, worst first.
+pub fn nxdomain_offenders(
+    conn: &Connection,
+    window_mins: u32,
+    threshold: u32,
+) -> Result<Vec<(String, i64)>> {
+    let cutoff = now() - i64::from(window_mins) * 60;
+    let mut stmt = conn.prepare(
+        "SELECT client_ip, COUNT(*) n FROM queries
+         WHERE ts >= ?1 AND status = 'nxdomain'
+         GROUP BY client_ip HAVING n >= ?2
+         ORDER BY n DESC",
+    )?;
+    let rows = stmt.query_map(params![cutoff, threshold], |r| Ok((r.get(0)?, r.get(1)?)))?;
+    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+}
+
+/// A device that is present on the network but barely resolving anything.
+#[derive(Debug, Clone, Serialize)]
+pub struct BypassSuspect {
+    pub mac: String,
+    pub ip: Option<String>,
+    pub hostname: Option<String>,
+    pub vendor: Option<String>,
+    pub last_seen: i64,
+    pub queries: i64,
+}
+
+/// Devices discovery can see, but which have sent almost no DNS.
+///
+/// This is the closest we can get to detecting a client that resolves past us
+/// — via DNS-over-HTTPS, or a hardcoded resolver. We cannot observe the
+/// bypassing traffic itself; we can only notice that a device is demonstrably
+/// present (ARP, mDNS or a sweep reached it inside the window) while asking us
+/// nothing. That is a signal, not proof: a genuinely idle device looks the
+/// same, which is why the dashboard presents these as suspects.
+///
+/// The per-device count is a correlated subquery rather than a
+/// `JOIN ... GROUP BY` on purpose. `devices.ip` carries no uniqueness
+/// constraint, so a join can fan out and inflate counts — the same hazard
+/// already fixed once in the query log.
+pub fn bypass_suspects(
+    conn: &Connection,
+    window_hours: u32,
+    max_queries: i64,
+    limit: u32,
+) -> Result<Vec<BypassSuspect>> {
+    let cutoff = now() - i64::from(window_hours) * 3600;
+    let mut stmt = conn.prepare(
+        "SELECT mac, ip, hostname, vendor, last_seen, queries FROM (
+             SELECT d.mac, d.ip, d.hostname, d.vendor, d.last_seen,
+                    (SELECT COUNT(*) FROM queries q
+                      WHERE q.client_ip = d.ip AND q.ts >= ?1) AS queries
+             FROM devices d
+             WHERE d.last_seen >= ?1 AND d.ip IS NOT NULL
+         )
+         WHERE queries <= ?2
+         ORDER BY queries ASC, last_seen DESC
+         LIMIT ?3",
+    )?;
+    let rows = stmt.query_map(params![cutoff, max_queries, limit], |r| {
+        Ok(BypassSuspect {
+            mac: r.get(0)?,
+            ip: r.get(1)?,
+            hostname: r.get(2)?,
+            vendor: r.get(3)?,
+            last_seen: r.get(4)?,
+            queries: r.get(5)?,
+        })
+    })?;
+    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+}
+
+/// Identity fields of every device already on record.
+///
+/// Deliberately lighter than [`DeviceRow`]: this runs once at startup to seed
+/// the in-memory registry and only needs to know who exists, not how much
+/// each has queried.
+#[derive(Debug, Clone)]
+pub struct KnownDevice {
+    pub mac: String,
+    pub ip: Option<String>,
+    pub hostname: Option<String>,
+    pub vendor: Option<String>,
+    pub randomized: bool,
+}
+
+/// Every device the database has ever seen, for [`crate::devices::DeviceStore::hydrate`].
+pub fn known_devices(conn: &Connection) -> Result<Vec<KnownDevice>> {
+    let mut stmt = conn.prepare("SELECT mac, ip, hostname, vendor, randomized FROM devices")?;
+    let rows = stmt.query_map([], |r| {
+        Ok(KnownDevice {
+            mac: r.get(0)?,
+            ip: r.get(1)?,
+            hostname: r.get(2)?,
+            vendor: r.get(3)?,
+            randomized: r.get::<_, i64>(4)? != 0,
+        })
+    })?;
+    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+}
+
 pub fn devices(conn: &Connection) -> Result<Vec<DeviceRow>> {
     let day = now() - 86_400;
     let mut stmt = conn.prepare(
@@ -778,6 +975,95 @@ mod tests {
             answer: None,
             blocklist: None,
         })
+    }
+
+    /// A device that is present but silent is the signature this panel exists
+    /// to surface; a busy one must never appear beside it.
+    #[test]
+    fn bypass_suspects_finds_the_present_but_silent_device() {
+        let mut conn = open(Path::new(":memory:")).unwrap();
+        let seen = now();
+
+        let present = |mac: &str, ip: &str, host: &str| WriteOp::Device {
+            mac: mac.to_string(),
+            ip: Some(ip.to_string()),
+            hostname: Some(host.to_string()),
+            vendor: Some("Test".to_string()),
+            randomized: false,
+            ts: seen,
+        };
+        flush(
+            &mut conn,
+            &[
+                present("aa:bb:cc:00:00:01", "192.168.1.50", "chatty-laptop"),
+                present("aa:bb:cc:00:00:02", "192.168.1.51", "silent-tv"),
+            ],
+        )
+        .unwrap();
+
+        // Only the laptop actually asks us anything.
+        let traffic: Vec<WriteOp> = (0..50)
+            .map(|i| query("192.168.1.50", &format!("host{i}.example.com")))
+            .collect();
+        flush(&mut conn, &traffic).unwrap();
+
+        let suspects = bypass_suspects(&conn, 24, 5, 20).unwrap();
+        assert_eq!(suspects.len(), 1, "only the silent device is a suspect");
+        assert_eq!(suspects[0].mac, "aa:bb:cc:00:00:02");
+        assert_eq!(suspects[0].queries, 0);
+    }
+
+    /// devices.ip has no uniqueness constraint, so a JOIN..GROUP BY here would
+    /// fan out and inflate the per-device count — the same defect already
+    /// fixed once in the query log. The correlated subquery must not.
+    #[test]
+    fn bypass_suspect_counts_do_not_fan_out_across_devices() {
+        let mut conn = open(Path::new(":memory:")).unwrap();
+        let seen = now();
+        let at = |mac: &str, ip: &str| WriteOp::Device {
+            mac: mac.to_string(),
+            ip: Some(ip.to_string()),
+            hostname: None,
+            vendor: None,
+            randomized: false,
+            ts: seen,
+        };
+
+        // Two devices that have historically shared one address.
+        flush(&mut conn, &[at("aa:bb:cc:00:00:01", "192.168.1.50")]).unwrap();
+        flush(&mut conn, &[at("a2:bb:cc:00:00:02", "192.168.1.50")]).unwrap();
+        flush(&mut conn, &[query("192.168.1.50", "example.com")]).unwrap();
+
+        let suspects = bypass_suspects(&conn, 24, 5, 20).unwrap();
+        for s in &suspects {
+            assert!(
+                s.queries <= 1,
+                "one query row must count once, got {} for {}",
+                s.queries,
+                s.mac
+            );
+        }
+    }
+
+    /// A device last seen long ago is not evidence of bypassing — it is just
+    /// gone. Only devices discovery reached inside the window qualify.
+    #[test]
+    fn bypass_suspects_ignores_devices_that_are_no_longer_around() {
+        let mut conn = open(Path::new(":memory:")).unwrap();
+        flush(
+            &mut conn,
+            &[WriteOp::Device {
+                mac: "aa:bb:cc:00:00:03".to_string(),
+                ip: Some("192.168.1.99".to_string()),
+                hostname: None,
+                vendor: None,
+                randomized: false,
+                ts: now() - 30 * 86_400,
+            }],
+        )
+        .unwrap();
+
+        assert!(bypass_suspects(&conn, 24, 5, 20).unwrap().is_empty());
     }
 
     #[test]

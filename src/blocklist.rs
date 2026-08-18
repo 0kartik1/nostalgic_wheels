@@ -402,7 +402,7 @@ pub async fn refresh_sources(cfg: &crate::config::Config, health: &HealthMap) ->
 }
 
 /// Install the ring crypto provider exactly once. Idempotent and cheap.
-fn ensure_crypto_provider() {
+pub(crate) fn ensure_crypto_provider() {
     static ONCE: std::sync::Once = std::sync::Once::new();
     ONCE.call_once(|| {
         // An error here means someone else already installed one, which is

@@ -284,6 +284,22 @@ td.domain { max-width: 340px; overflow: hidden; text-overflow: ellipsis; }
 </section>
 
 <section class="card" style="margin-bottom:14px">
+  <header>
+    <h2>Alerts</h2>
+    <span class="note" id="alerts-note"></span>
+  </header>
+  <div id="alerts"></div>
+</section>
+
+<section class="card" style="margin-bottom:14px">
+  <header>
+    <h2>Bypass suspects</h2>
+    <span class="note" id="bypass-note"></span>
+  </header>
+  <div id="bypass"></div>
+</section>
+
+<section class="card" style="margin-bottom:14px">
   <header><h2>Query log</h2><span class="note" id="log-note"></span></header>
   <div class="filters">
     <input type="search" id="q-search" placeholder="Filter by domain…" aria-label="Filter by domain">
@@ -752,6 +768,54 @@ function renderDevices(rows) {
       </tr>`).join("")}</tbody></table>`;
 }
 
+function renderAlerts(rows) {
+  const host = $("alerts");
+  $("alerts-note").textContent = rows.length ? `${rows.length} most recent` : "";
+  if (!rows.length) {
+    host.innerHTML = '<div class="empty">Nothing to report. New devices and NXDOMAIN storms show up here.</div>';
+    return;
+  }
+  const colour = (sev) => sev === "warning" ? "var(--warning)" : "var(--text-muted)";
+  host.innerHTML = `<div class="scroll"><table>
+    <thead><tr><th>When</th><th>What</th><th>Detail</th><th>Pushed</th></tr></thead>
+    <tbody>${rows.map((a) => `
+      <tr>
+        <td>${esc(ago(a.ts))}</td>
+        <td><span class="tag" style="color:${colour(a.severity)}">${esc(a.kind.replace(/_/g, " "))}</span></td>
+        <td>${esc(a.detail)}</td>
+        <td>${a.notified
+          ? '<span title="Delivered to ntfy">sent</span>'
+          : '<span style="color:var(--text-muted)" title="Recorded here only — either no alerts.ntfy_url is set, or delivery failed">—</span>'}</td>
+      </tr>`).join("")}</tbody></table></div>`;
+}
+
+function renderBypass(rows) {
+  const host = $("bypass");
+  $("bypass-note").textContent = "seen on the network, but barely asking us anything";
+  if (!rows.length) {
+    host.innerHTML = '<div class="empty">Nothing suspicious. Every device discovered recently is also resolving through netwatch.</div>';
+    return;
+  }
+  host.innerHTML = `<p class="note" style="margin:0 0 10px">
+      These devices answered a sweep or announced themselves, yet sent almost no DNS.
+      That is what a client using DNS-over-HTTPS or a hardcoded resolver looks like from here.
+      A genuinely idle device looks the same, so treat this as a lead, not a verdict.
+    </p>
+    <div class="scroll"><table>
+    <thead><tr>
+      <th>Device</th><th>IP</th><th>MAC</th><th>Vendor</th>
+      <th class="num">Queries 24h</th><th>Last seen</th>
+    </tr></thead><tbody>${rows.map((d) => `
+      <tr>
+        <td>${d.hostname ? esc(d.hostname) : '<span style="color:var(--text-muted)">unnamed</span>'}</td>
+        <td class="mono">${esc(d.ip || "—")}</td>
+        <td class="mono">${esc(d.mac)}</td>
+        <td>${esc(d.vendor || "—")}</td>
+        <td class="num"><span style="color:var(--warning)">${num(d.queries)}</span></td>
+        <td>${esc(ago(d.last_seen))}</td>
+      </tr>`).join("")}</tbody></table></div>`;
+}
+
 function renderLog(rows) {
   const host = $("log");
   $("log-note").textContent = `${rows.length} most recent`;
@@ -893,7 +957,7 @@ async function refresh() {
   });
 
   try {
-    const [summary, status, series, iface, topd, topb, clients, qtypes, devices, log] = await Promise.all([
+    const [summary, status, series, iface, topd, topb, clients, qtypes, devices, alerts, bypass, log] = await Promise.all([
       api("/api/summary"),
       api("/api/status"),
       api(`/api/timeseries?hours=${h}`),
@@ -903,6 +967,8 @@ async function refresh() {
       api(`/api/top-clients?hours=${h}&limit=12`),
       api(`/api/query-types?hours=${h}`),
       api("/api/devices"),
+      api("/api/alerts?limit=25"),
+      api("/api/bypass-suspects"),
       api(`/api/queries?${logParams}`)
     ]);
 
@@ -914,6 +980,8 @@ async function refresh() {
     renderRanked("top-blocked", topb, "var(--series-blocked)");
     renderRanked("query-types", qtypes, "var(--series-allowed)");
     renderDevices(devices);
+    renderAlerts(alerts);
+    renderBypass(bypass);
     if (!state.paused) renderLog(log);
     $("subtitle").textContent =
       `${num(status.blocked_domains)} domains blocked · serving DNS on ${status.dns_listen}`;
