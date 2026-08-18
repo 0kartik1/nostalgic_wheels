@@ -687,6 +687,35 @@ pub struct DeviceRow {
     pub blocked_24h: i64,
 }
 
+/// Identity fields of every device already on record.
+///
+/// Deliberately lighter than [`DeviceRow`]: this runs once at startup to seed
+/// the in-memory registry and only needs to know who exists, not how much
+/// each has queried.
+#[derive(Debug, Clone)]
+pub struct KnownDevice {
+    pub mac: String,
+    pub ip: Option<String>,
+    pub hostname: Option<String>,
+    pub vendor: Option<String>,
+    pub randomized: bool,
+}
+
+/// Every device the database has ever seen, for [`crate::devices::DeviceStore::hydrate`].
+pub fn known_devices(conn: &Connection) -> Result<Vec<KnownDevice>> {
+    let mut stmt = conn.prepare("SELECT mac, ip, hostname, vendor, randomized FROM devices")?;
+    let rows = stmt.query_map([], |r| {
+        Ok(KnownDevice {
+            mac: r.get(0)?,
+            ip: r.get(1)?,
+            hostname: r.get(2)?,
+            vendor: r.get(3)?,
+            randomized: r.get::<_, i64>(4)? != 0,
+        })
+    })?;
+    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+}
+
 pub fn devices(conn: &Connection) -> Result<Vec<DeviceRow>> {
     let day = now() - 86_400;
     let mut stmt = conn.prepare(

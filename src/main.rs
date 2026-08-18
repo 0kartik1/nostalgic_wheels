@@ -196,6 +196,22 @@ async fn main() -> Result<()> {
     tracing::info!("{} MAC vendor prefixes available", oui_db.len());
     let device_store = devices::DeviceStore::new(oui_db, writer.clone());
 
+    // Load what we already know before any discovery runs. Beyond filling the
+    // dashboard immediately, this is what makes "have we seen this MAC before"
+    // a question about the network rather than about how long ago netwatch
+    // restarted.
+    match read_handle
+        .lock()
+        .map_err(|_| anyhow::anyhow!("database mutex poisoned"))
+        .and_then(|c| db::known_devices(&c))
+    {
+        Ok(rows) => {
+            let n = device_store.hydrate(rows);
+            tracing::info!("loaded {n} known devices from the database");
+        }
+        Err(e) => tracing::warn!("could not load known devices: {e:#}"),
+    }
+
     // Figure out where we are on the network.
     let route = netinfo::default_route();
     let subnet = match &cfg.discovery.subnet {
