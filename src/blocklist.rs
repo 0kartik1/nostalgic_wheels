@@ -74,6 +74,17 @@ impl Blocklist {
         if let Some(&src) = self.exact.get(domain) {
             return Some(self.source_name(src));
         }
+        // A `*.example.com` rule covers example.com itself, not only what sits
+        // beneath it. That is what every other DNS blocker means by the
+        // notation — dnsmasq's `local=/example.com/`, AdGuard's `||example.com^`
+        // — and it matters because wildcard lists name the exact host they are
+        // trying to block. Hagezi's wildcard/*.txt lists are entirely entries
+        // like `*.analytics.example.com`, where the host actually serving the
+        // tracker is analytics.example.com; matching subdomains only would let
+        // through precisely the name the list exists to stop.
+        if let Some(&src) = self.wildcards.get(domain) {
+            return Some(self.source_name(src));
+        }
         // Walk up the labels: a.b.example.com checks b.example.com, example.com...
         let mut rest = domain;
         while let Some(dot) = rest.find('.') {
@@ -90,6 +101,11 @@ impl Blocklist {
 
     fn is_allowed(&self, domain: &str) -> bool {
         if self.allow.contains(domain) {
+            return true;
+        }
+        // Same apex rule as `lookup`, so an allow entry cannot be narrower
+        // than the block entry it is meant to override.
+        if self.allow_wildcards.contains(domain) {
             return true;
         }
         let mut rest = domain;
@@ -150,6 +166,25 @@ impl Blocklist {
                 continue;
             }
 
+            // Adblock Plus syntax, the format OISD and Hagezi publish by
+            // default: `||example.com^`, with `@@||example.com^` as an
+            // exception. Without this an ABP list parses to nothing at all —
+            // every line survives comment-stripping as a single token that
+            // then fails domain validation, so the list loads "successfully"
+            // and blocks zero domains.
+            if let Some(entry) = parse_adblock(line) {
+                match entry {
+                    // `||example.com^` covers the domain and everything under
+                    // it, which is what a wildcard rule already means here.
+                    AdblockRule::Block(d) if !allow => self.add_block(&format!("*.{d}"), source_id),
+                    AdblockRule::Block(d) => self.add_allow(&format!("*.{d}")),
+                    // An exception is an allow rule regardless of which list
+                    // it arrived on: `@@` exists to punch holes in blocking.
+                    AdblockRule::Exception(d) => self.add_allow(&format!("*.{d}")),
+                }
+                continue;
+            }
+
             // hosts format: "0.0.0.0 domain [domain...]" or "127.0.0.1 domain".
             let mut fields = line.split_whitespace();
             let first = fields.next().unwrap_or("");
@@ -202,6 +237,51 @@ impl Blocklist {
             .unwrap_or_else(|| path.display().to_string());
         Ok(self.ingest(&contents, &name, allow))
     }
+}
+
+/// One rule recovered from Adblock Plus syntax.
+enum AdblockRule {
+    Block(String),
+    Exception(String),
+}
+
+/// Recognise the domain-anchored subset of Adblock Plus syntax.
+///
+/// Deliberately narrow. ABP is a rich format covering element hiding, regex
+/// patterns and request-type modifiers, none of which a DNS blocker can act
+/// on. Only `||domain^` and `@@||domain^` map cleanly onto a DNS rule, so
+/// anything carrying a modifier, a path, or a wildcard is skipped rather than
+/// approximated — a rule we cannot honour exactly is worse than one we ignore.
+fn parse_adblock(line: &str) -> Option<AdblockRule> {
+    // `[Adblock Plus 2.0]` and similar headers.
+    if line.starts_with('[') {
+        return None;
+    }
+
+    let (rest, exception) = match line.strip_prefix("@@") {
+        Some(r) => (r, true),
+        None => (line, false),
+    };
+    let rest = rest.strip_prefix("||")?;
+
+    // Everything up to the separator is the domain; `$` introduces modifiers
+    // (`$third-party`, `$document`) that change what the rule applies to, and
+    // honouring the domain while dropping the modifier would over-block.
+    let (domain, tail) = match rest.find(['^', '$', '/']) {
+        Some(i) => (&rest[..i], &rest[i..]),
+        None => (rest, ""),
+    };
+    let has_modifier = tail.contains('$') || tail.contains('/');
+    if has_modifier || domain.is_empty() || domain.contains('*') {
+        return None;
+    }
+
+    let d = domain.to_string();
+    Some(if exception {
+        AdblockRule::Exception(d)
+    } else {
+        AdblockRule::Block(d)
+    })
 }
 
 enum Entry {
@@ -480,7 +560,20 @@ pub fn build(cfg: &crate::config::Config) -> Blocklist {
             Ok(contents) => {
                 // `ingest` registers the source itself; pushing here too would
                 // list it twice in the dashboard.
-                bl.ingest(&contents, url, false);
+                let added = bl.ingest(&contents, url, false);
+                // A list that downloads fine but parses to nothing is the
+                // quiet failure worth shouting about: the usual cause is a
+                // format netwatch does not read, and everything else about the
+                // run looks perfectly healthy.
+                if added == 0 && !contents.trim().is_empty() {
+                    tracing::warn!(
+                        "{url} contributed no domains ({} bytes downloaded). Either every \
+                         entry is already covered by an earlier list, or the format is not \
+                         one netwatch reads — it understands hosts files, one-domain-per-line \
+                         and wildcard lists, and Adblock Plus rules of the form ||domain^.",
+                        contents.len()
+                    );
+                }
             }
             Err(e) => tracing::error!("reading cached list {}: {e}", path.display()),
         }
@@ -558,6 +651,120 @@ pub fn remove_manual(path: &Path, domain: &str) -> Result<()> {
 }
 
 #[cfg(test)]
+mod format_tests {
+    use super::*;
+
+    #[test]
+    fn a_wildcard_rule_covers_the_domain_it_names() {
+        let mut bl = Blocklist::default();
+        bl.ingest("*.analytics.example.com\n", "hagezi-wildcard", false);
+
+        assert_eq!(
+            bl.lookup("analytics.example.com"),
+            Some("hagezi-wildcard"),
+            "the named host must be blocked, not just its subdomains"
+        );
+        assert_eq!(
+            bl.lookup("eu.analytics.example.com"),
+            Some("hagezi-wildcard")
+        );
+        assert_eq!(
+            bl.lookup("example.com"),
+            None,
+            "but the rule must not climb above what it named"
+        );
+    }
+
+    /// An allow rule has to be able to override a block rule of the same shape,
+    /// which means the apex behaviour must match on both sides.
+    #[test]
+    fn a_wildcard_allow_also_covers_the_domain_it_names() {
+        let mut bl = Blocklist::default();
+        bl.ingest("*.cdn.example.com\n", "block", false);
+        bl.ingest("*.cdn.example.com\n", "allow", true);
+
+        assert_eq!(bl.lookup("cdn.example.com"), None);
+        assert_eq!(bl.lookup("img.cdn.example.com"), None);
+    }
+
+    /// Before this, an Adblock Plus list downloaded fine, reported success and
+    /// blocked exactly nothing.
+    #[test]
+    fn adblock_plus_rules_are_parsed() {
+        let mut bl = Blocklist::default();
+        let n = bl.ingest(
+            "[Adblock Plus 2.0]\n\
+             ! Title: test\n\
+             ||ads.example.com^\n\
+             ||tracker.example.net^\n",
+            "oisd-abp",
+            false,
+        );
+
+        assert_eq!(n, 2, "two rules, two domains");
+        assert_eq!(bl.lookup("ads.example.com"), Some("oisd-abp"));
+        assert_eq!(
+            bl.lookup("pixel.ads.example.com"),
+            Some("oisd-abp"),
+            "||domain^ covers subdomains as well"
+        );
+        assert_eq!(bl.lookup("example.com"), None);
+    }
+
+    #[test]
+    fn adblock_exceptions_become_allow_rules() {
+        let mut bl = Blocklist::default();
+        bl.ingest("||example.com^\n@@||safe.example.com^\n", "abp", false);
+
+        assert_eq!(bl.lookup("tracker.example.com"), Some("abp"));
+        assert_eq!(
+            bl.lookup("safe.example.com"),
+            None,
+            "@@ exists to punch a hole in the blocking"
+        );
+    }
+
+    /// ABP describes far more than a DNS blocker can act on. A rule carrying a
+    /// modifier or a path applies only in conditions we cannot evaluate, so
+    /// honouring the domain part alone would over-block.
+    #[test]
+    fn adblock_rules_we_cannot_honour_exactly_are_skipped() {
+        let mut bl = Blocklist::default();
+        let n = bl.ingest(
+            "||example.com^$third-party\n\
+             ||example.org/ads/banner.png\n\
+             ||*.example.net^\n\
+             ##.advert\n",
+            "abp",
+            false,
+        );
+
+        assert_eq!(n, 0, "none of these map cleanly onto a DNS decision");
+        assert_eq!(bl.lookup("example.com"), None);
+        assert_eq!(bl.lookup("example.org"), None);
+    }
+
+    /// hosts format has to keep working exactly as before.
+    #[test]
+    fn hosts_format_is_unaffected() {
+        let mut bl = Blocklist::default();
+        bl.ingest(
+            "0.0.0.0 ads.example.com\n127.0.0.1 localhost\n",
+            "sb",
+            false,
+        );
+
+        assert_eq!(bl.lookup("ads.example.com"), Some("sb"));
+        assert_eq!(bl.lookup("localhost"), None);
+        assert_eq!(
+            bl.lookup("sub.ads.example.com"),
+            None,
+            "a hosts entry is exact, unlike a wildcard rule"
+        );
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -576,14 +783,21 @@ mod tests {
         assert_eq!(bl.lookup("example.com"), None);
     }
 
+    /// Changed deliberately: a `*.` rule used to cover subdomains but not the
+    /// name it was written against. That reading is unique to us — dnsmasq's
+    /// `local=/doubleclick.net/`, AdGuard's `||doubleclick.net^` and Pi-hole's
+    /// `(^|\.)doubleclick\.net$` all include the apex — and it quietly broke
+    /// wildcard-format lists, whose entries name the exact host to block.
     #[test]
-    fn wildcards_match_subdomains_only() {
+    fn wildcards_cover_the_apex_and_everything_under_it() {
         let mut bl = Blocklist::default();
         bl.ingest("*.doubleclick.net\n", "test", false);
         assert_eq!(bl.lookup("stats.g.doubleclick.net"), Some("test"));
         assert_eq!(bl.lookup("ad.doubleclick.net"), Some("test"));
-        // The apex itself is not covered by a `*.` rule.
-        assert_eq!(bl.lookup("doubleclick.net"), None);
+        assert_eq!(bl.lookup("doubleclick.net"), Some("test"));
+        // Still bounded by what the rule actually named.
+        assert_eq!(bl.lookup("net"), None);
+        assert_eq!(bl.lookup("notdoubleclick.net"), None);
     }
 
     #[test]

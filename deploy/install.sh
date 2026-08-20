@@ -127,7 +127,7 @@ The dashboard listens on loopback only by default, because it can change block
 rules and flush the DNS cache. To reach it from another machine, either:
 
   Tunnel over SSH (nothing to configure, nothing exposed)
-      ssh -L 8080:localhost:8080 $(whoami)@$IP
+      ssh -L 8080:localhost:8080 ${SUDO_USER:-$(whoami)}@$IP
       then browse to http://localhost:8080
 
   Or bind it to the LAN, which requires a token:

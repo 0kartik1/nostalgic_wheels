@@ -4,6 +4,21 @@ Documentation=https://github.com/0kartik1/nostalgic_wheels
 After=network-online.target
 Wants=network-online.target
 
+# Order-only, not a hard dependency: if tailscaled is installed and manages
+# /etc/resolv.conf (Tailscale's MagicDNS, 100.100.100.100), that address only
+# answers once tailscaled has actually connected — network-online.target alone
+# does not guarantee that. Without this, a fresh boot can race blocklist
+# downloads against Tailscale coming up: the interface is "online" but the
+# resolver netwatch's own HTTP client depends on for fetching lists by
+# hostname is not yet reachable, and the first-run download fails outright.
+# Harmless on a host with no tailscaled unit — systemd simply skips an
+# ordering rule for a unit that does not exist.
+#
+# Does not affect DNS service to the LAN: upstreams are configured as literal
+# IPs (1.1.1.1, 9.9.9.9), so answering queries never depends on this at all —
+# only fetching blocklists by URL does.
+After=tailscaled.service
+
 # Give up after 5 failed starts in 5 minutes instead of restarting forever.
 # netwatch already rides out a contended port 53 for 30s inside the process
 # (dns::bind_with_retry), so a process that starts, fails and exits repeatedly
@@ -55,9 +70,15 @@ SystemCallArchitectures=native
 SystemCallFilter=@system-service
 SystemCallErrorNumber=EPERM
 
-# A home network does not need more than this, and capping it means a runaway
-# query log cannot take the Pi down.
-MemoryMax=512M
+# A cap so a runaway query log cannot take the Pi down, with room for the
+# blocklists. Measured with ~785k domains across five lists: ~73 MB after a
+# cold start, peaking ~154 MB during a refresh (the old and new matcher are
+# both live while the new one is built) and settling around 150 MB — glibc
+# holds freed arenas rather than returning them, which plateaus rather than
+# growing. Roughly 76 bytes per domain, so budget ~150 MB per million.
+# 1G leaves headroom for the largest list combinations; drop it back to 512M
+# if you run a single list and want a tighter bound.
+MemoryMax=1G
 TasksMax=256
 
 [Install]
