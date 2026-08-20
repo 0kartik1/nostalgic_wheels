@@ -335,6 +335,43 @@ Everything the dashboard shows is available as JSON:
 | `POST /api/reload` | Re-download blocklists |
 | `POST /api/flush-cache` | Drop the DNS cache |
 
+## Blocklists
+
+Four formats are understood, which between them cover essentially everything
+published:
+
+| Format | Looks like | Used by |
+|---|---|---|
+| hosts | `0.0.0.0 ads.example.com` | StevenBlack, AdAway, OISD `/hosts` |
+| one per line | `ads.example.com` | many small lists |
+| wildcard | `*.ads.example.com` | Hagezi `wildcard/` |
+| Adblock Plus | `\|\|ads.example.com^` | OISD default, Hagezi `adblock/` |
+
+Only the domain-anchored subset of Adblock Plus is read. A rule carrying a
+modifier, a path or a wildcard (`||example.com^$third-party`,
+`||example.com/ads/`) applies under conditions a DNS resolver cannot evaluate,
+so it is skipped rather than approximated — over-blocking from a rule we cannot
+honour exactly is worse than ignoring it. Hagezi's `dnsmasq/` variants are not
+read; use the `wildcard/` or `adblock/` ones.
+
+**Wildcard and ABP rules cover the name they are written against**, not just
+what sits beneath it: `*.ads.example.com` blocks `ads.example.com` itself, the
+same as dnsmasq's `local=/ads.example.com/` and AdGuard's `||ads.example.com^`.
+
+Overlap between lists is heavy, so the total lands far below the sum. The
+dashboard shows what each source contributed *that no earlier source already
+had*, which makes redundancy obvious. A source contributing **0** is either
+fully covered by an earlier list or in a format netwatch cannot read — the log
+says which, rather than leaving you with a list that loads cleanly and blocks
+nothing.
+
+Measured with ~785k domains across five lists: **~76 bytes per domain**, so
+~73 MB resident after a cold start. A refresh briefly holds the old and new
+matcher at once, peaking around 154 MB and settling near 150 MB — glibc keeps
+freed arenas rather than returning them, so it plateaus rather than growing.
+Budget roughly 150 MB per million domains; the unit allows 1 GB. Lookups cost
+about 120 ns regardless of list size, so adding lists is free at query time.
+
 ## Alerts
 
 The dashboard only reports to whoever is looking at it. Two conditions get
@@ -378,6 +415,7 @@ behaviour was wrong for everyone. Both are one line to restore.
 | Changed | Why | To restore the old behaviour |
 |---|---|---|
 | `web.listen` is now `127.0.0.1:8080` (was `0.0.0.0:8080`) | Unauthenticated endpoints that rewrite DNS policy were reachable from the whole LAN | Set `listen = "0.0.0.0:8080"` **and** an `admin_token` — see [Reaching it, safely](#reaching-it-safely) |
+| A `*.example.com` rule now also blocks `example.com` | It previously covered only subdomains, which is unique to netwatch and silently under-blocked wildcard-format lists — whose entries name the exact host to block | Write the subdomains you want individually if you relied on the old reading |
 | `blocking.disable_firefox_doh` is new and defaults to `true` | Firefox's own DNS-over-HTTPS made its queries invisible, so the dashboard under-reported without saying so | Set `disable_firefox_doh = false` under `[blocking]` |
 | `discovery.dhcp` is now `false` (was `true`) | A UDP/67 socket shares a reuseport group with any same-user DHCP server, and losing household DHCP is worse than losing hostnames | Set `dhcp = true` if nothing else on the Pi serves DHCP (`sudo ss -ulnp \| grep :67`) |
 

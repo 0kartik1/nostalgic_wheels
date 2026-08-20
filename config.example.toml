@@ -84,13 +84,19 @@ listen = "127.0.0.1:8080"
 [storage]
 database = "/var/lib/netwatch/netwatch.db"
 
-# Query log rows older than this are deleted hourly. On an SD card, 14 days of
-# a normal household is roughly 50-150 MB.
+# Query log rows older than this are deleted hourly. A normal household is
+# roughly 50-150 MB per 14 days.
+#
+# The default is sized for an SD card. On an SSD there is no reason to be shy:
+# 90 days costs a few hundred MB and is what makes "is this device behaving
+# differently than last month" answerable at all.
 retention_days = 14
 
-# Writes are batched for this long before committing, which matters a lot for
-# SD card lifespan. Raise it to reduce wear further at the cost of the log
-# lagging slightly behind live traffic.
+# Writes are batched for this long before committing. On an SD card this is
+# about lifespan — batching is the difference between a card that lasts and one
+# that does not. On an SSD it is only about latency, so 250 is comfortable and
+# gives a fresher log; the batching still helps by turning many small commits
+# into fewer larger ones.
 flush_interval_ms = 750
 
 [discovery]
@@ -141,10 +147,36 @@ enabled = true
 #   "nxdomain" -> NXDOMAIN (tidier, but some apps retry harder)
 mode = "zero_ip"
 
-# Blocklists to download. StevenBlack's unified list is the usual starting
-# point (~130k domains: ads plus malware).
+# Blocklists to download. Four formats are understood: hosts files, one
+# domain per line, wildcard lists (*.example.com), and the domain-anchored
+# subset of Adblock Plus syntax (||example.com^, @@||example.com^).
+#
+# Overlap between lists is large, so the total is far below the sum. The
+# dashboard shows how many domains each source contributed *that no earlier
+# source already had* — a source showing 0 is either fully redundant or in a
+# format netwatch cannot read, and the log says which.
+#
+# Order matters only for attribution: the first list to claim a domain is the
+# one the query log names.
 sources = [
+  # ~135k. Ads plus malware; the usual starting point.
   "https://raw.githubusercontent.com/StevenBlack/hosts/master/hosts",
+
+  # Hagezi. Pick ONE tier — they are cumulative, not additive:
+  #   multi.txt      light, low breakage
+  #   pro.txt        the recommended balance
+  #   pro.plus.txt   more aggressive
+  #   ultimate.txt   maximal, expect to allowlist things
+  # "https://raw.githubusercontent.com/hagezi/dns-blocklists/main/wildcard/pro.txt",
+
+  # Hagezi Threat Intelligence Feed — malware, phishing, C2. Complements any
+  # of the above rather than overlapping much.
+  # "https://raw.githubusercontent.com/hagezi/dns-blocklists/main/wildcard/tif.txt",
+
+  # OISD. Also pick one tier. Serves several formats; the hosts and abp ones
+  # both parse here.
+  # "https://big.oisd.nl/hosts",
+
   # Known DNS-over-HTTPS endpoints. Blocking these pushes devices that would
   # otherwise resolve past you back onto system DNS. Not airtight — a client
   # with a hardcoded IP still gets through — but it closes the easy cases.
