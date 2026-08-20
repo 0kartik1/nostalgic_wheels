@@ -515,6 +515,7 @@ journalctl -u netwatch -n 100 --no-pager
 | Devices show as `unnamed` | Normal for IoT gear that announces no name; the vendor column still identifies it |
 | `mDNS discovery unavailable` | Avahi already owns port 5353. Harmless; DHCP and reverse DNS still name devices |
 | One device logs nothing | It is probably using DoH or a hardcoded resolver — see [Devices can bypass you](#devices-that-bypass-you) and the dashboard's Bypass suspects panel |
+| First-run blocklist download fails with "Temporary failure in name resolution" | The OS resolver was unreachable at boot. Common with Tailscale's MagicDNS (100.100.100.100 in /etc/resolv.conf), which only answers once tailscaled has connected — `network-online.target` alone does not guarantee that. The shipped unit orders after `tailscaled.service` if present; `POST /api/reload` retries once connectivity is up. LAN DNS is unaffected either way, since upstreams are configured as literal IPs |
 | Restarting in a loop, or `Active: failed` after several tries | Almost always a bad config. `netwatch --check-config` names the line; `journalctl -u netwatch` shows the same error. systemd stops after 5 failed starts in 5 minutes rather than looping silently |
 
 Run in the foreground to debug:
