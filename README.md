@@ -433,9 +433,21 @@ reopens it afterwards):
 
 ```bash
 sudo systemctl stop netwatch
-sudo -u netwatch sqlite3 /var/lib/netwatch/netwatch.db "PRAGMA auto_vacuum=INCREMENTAL; VACUUM;"
+sudo -u netwatch netwatch --rebuild-db
 sudo systemctl start netwatch
 ```
+
+It reports the size before and after. No `sqlite3` needed — that is not
+installed on a default Raspberry Pi OS image, and netwatch already carries
+SQLite. To check whether you need it at all, look at the Storage row on the
+dashboard, or:
+
+```bash
+curl -s localhost:8080/api/status | grep -o '"incremental_vacuum":[a-z]*'
+```
+
+`false` means the database cannot shrink on its own and the rebuild is worth
+running; `true` means there is nothing to do.
 
 ## Configuration
 

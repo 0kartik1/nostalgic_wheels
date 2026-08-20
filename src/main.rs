@@ -57,6 +57,12 @@ struct Cli {
     /// 1 with the reason if not. Run this before restarting the service.
     #[arg(long)]
     check_config: bool,
+
+    /// Rebuild the database so it can reclaim space on its own, then exit.
+    /// Only needed once, for a database created before netwatch enabled
+    /// incremental auto-vacuum. Stop the service first.
+    #[arg(long)]
+    rebuild_db: bool,
 }
 
 /// Apply the command-line overrides on top of a loaded config.
@@ -140,6 +146,29 @@ async fn main() -> Result<()> {
 
     let mut cfg = loaded?;
     apply_overrides(&mut cfg, &cli);
+
+    if cli.rebuild_db {
+        let path = &cfg.storage.database;
+        println!("rebuilding {} — do not interrupt", path.display());
+        // Reported rather than propagated, for the same reason as
+        // --check-config: this is run by hand, and a backtrace buries the one
+        // line that says what to do.
+        match db::rebuild_database(path) {
+            Ok((before, after)) => {
+                let mb = |b: u64| b as f64 / 1_048_576.0;
+                println!(
+                    "done: {:.1} MB -> {:.1} MB. It can now reclaim space as rows are pruned.",
+                    mb(before),
+                    mb(after)
+                );
+                return Ok(());
+            }
+            Err(e) => {
+                eprintln!("could not rebuild the database:\n\n{e:#}");
+                std::process::exit(1);
+            }
+        }
+    }
 
     if cli.print_config {
         println!("{}", toml::to_string_pretty(&cfg)?);

@@ -424,6 +424,73 @@ fn flush(conn: &mut Connection, ops: &[WriteOp]) -> Result<()> {
     Ok(())
 }
 
+/// Translate SQLite's lock errors into the thing the operator actually has to
+/// do about them.
+fn busy_aware(r: rusqlite::Result<()>) -> Result<()> {
+    match r {
+        Err(e)
+            if matches!(
+                e.sqlite_error_code(),
+                Some(rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked)
+            ) =>
+        {
+            anyhow::bail!(
+                "the database is in use by another process. netwatch is almost certainly \
+                 still running — stop it first:\n    sudo systemctl stop netwatch\n\
+                 then re-run this, then start it again."
+            )
+        }
+        other => Ok(other?),
+    }
+}
+
+/// Turn on incremental auto-vacuum and rebuild the file.
+///
+/// `auto_vacuum` can only be set on a database with no header yet, so one
+/// created before netwatch enabled it stays at NONE forever: pruning frees
+/// pages inside the file without the file ever shrinking. The only way out is
+/// a full `VACUUM`, which rewrites the whole database.
+///
+/// Exposed as `netwatch --rebuild-db` so this does not need the `sqlite3` CLI,
+/// which is not installed on a default Raspberry Pi OS image. Requires an
+/// exclusive lock, so the service has to be stopped first — SQLite reports
+/// that as a busy error and the caller turns it into an explanation.
+///
+/// Returns the file size before and after.
+pub fn rebuild_database(path: &Path) -> Result<(u64, u64)> {
+    let before = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+
+    let conn =
+        Connection::open(path).with_context(|| format!("opening database {}", path.display()))?;
+    // Fail fast rather than sitting on a lock the running service holds.
+    conn.busy_timeout(Duration::from_secs(2))?;
+
+    // Order matters, as it does in SCHEMA: journal_mode writes a header, after
+    // which auto_vacuum is silently ignored. VACUUM is what actually applies
+    // the new setting by rewriting the file.
+    //
+    // Both steps need exclusive access, and "database is locked" on its own
+    // sends people looking for a corrupt file rather than a running service.
+    busy_aware(conn.execute_batch("PRAGMA auto_vacuum = INCREMENTAL;"))
+        .context("setting auto_vacuum")?;
+    busy_aware(conn.execute_batch("VACUUM;")).context("rebuilding the database")?;
+    // In WAL mode the rewritten pages land in the WAL, so the main file keeps
+    // its old size until they are checkpointed back into it. Without this the
+    // command reports "18.7 MB -> 18.7 MB" and looks like it did nothing —
+    // the same trap already hit once in `maintain`.
+    conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+        .context("checkpointing after VACUUM")?;
+
+    anyhow::ensure!(
+        incremental_vacuum_available(&conn),
+        "VACUUM completed but auto_vacuum is still not INCREMENTAL; the database may be \
+         open in another process"
+    );
+
+    let after = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+    Ok((before, after))
+}
+
 /// How long recorded alerts are kept, independent of storage.retention_days.
 const ALERT_RETENTION_DAYS: i64 = 90;
 
@@ -1064,6 +1131,72 @@ mod tests {
         .unwrap();
 
         assert!(bypass_suspects(&conn, 24, 5, 20).unwrap().is_empty());
+    }
+
+    /// A database created before netwatch set auto_vacuum stays at NONE
+    /// forever, so pruning frees pages inside the file without the file ever
+    /// shrinking. This is the one-shot escape, and it has to actually shrink:
+    /// an early version reported "18.7 MB -> 18.7 MB" because in WAL mode the
+    /// rewritten pages sit in the WAL until they are checkpointed back.
+    #[test]
+    fn rebuilding_a_legacy_database_shrinks_it_and_enables_auto_vacuum() {
+        let dir = std::env::temp_dir().join(format!("netwatch-rebuild-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("legacy.db");
+
+        {
+            let conn = Connection::open(&path).unwrap();
+            // WAL first, which is what silently pins auto_vacuum at NONE.
+            conn.execute_batch(
+                "PRAGMA journal_mode = WAL;
+                 PRAGMA auto_vacuum = INCREMENTAL;
+                 CREATE TABLE queries (id INTEGER PRIMARY KEY AUTOINCREMENT, domain TEXT);",
+            )
+            .unwrap();
+            assert!(
+                !incremental_vacuum_available(&conn),
+                "precondition: this is a database that cannot reclaim space"
+            );
+
+            let tx = conn.unchecked_transaction().unwrap();
+            {
+                let mut stmt = tx
+                    .prepare("INSERT INTO queries (domain) VALUES (?1)")
+                    .unwrap();
+                for i in 0..60_000 {
+                    stmt.execute(params![format!("host{i}.example.com")])
+                        .unwrap();
+                }
+            }
+            tx.commit().unwrap();
+            conn.execute("DELETE FROM queries WHERE id > 500", [])
+                .unwrap();
+            conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+                .unwrap();
+        }
+
+        let (before, after) = rebuild_database(&path).unwrap();
+        assert!(
+            after < before / 2,
+            "the file must actually shrink: {before} -> {after}"
+        );
+
+        let conn = Connection::open(&path).unwrap();
+        assert!(
+            incremental_vacuum_available(&conn),
+            "and be able to reclaim space by itself from now on"
+        );
+        let mode: String = conn
+            .query_row("PRAGMA journal_mode", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(mode, "wal", "WAL must survive the rebuild");
+        let rows: i64 = conn
+            .query_row("SELECT COUNT(*) FROM queries", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(rows, 500, "and no data may be lost");
+
+        drop(conn);
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
